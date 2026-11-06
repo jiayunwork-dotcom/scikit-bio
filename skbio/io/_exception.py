@@ -126,6 +126,12 @@ class StockholmFormatError(FileFormatError):
     pass
 
 
+class NexusFormatError(FileFormatError):
+    """Raised when a ``nexus`` formatted file cannot be parsed."""
+
+    pass
+
+
 class InvalidRegistrationError(Exception):
     """Raised if function doesn't meet the expected API of its registration."""
 

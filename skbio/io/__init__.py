@@ -49,6 +49,7 @@ are supported by each format, see the associated documentation.
    jplace
    lsmat
    newick
+   nexus
    ordination
    phylip
    phylip_dm
@@ -121,6 +122,7 @@ Exceptions and warnings
    GFF3FormatError
    LSMatFormatError
    NewickFormatError
+   NexusFormatError
    JplaceFormatError
    OrdinationFormatError
    PhylipFormatError
@@ -321,6 +323,7 @@ from ._exception import (
     FASTQFormatError,
     LSMatFormatError,
     NewickFormatError,
+    NexusFormatError,
     JplaceFormatError,
     OrdinationFormatError,
     PhylipFormatError,
@@ -357,6 +360,7 @@ __all__ = [
     "GFF3FormatError",
     "LSMatFormatError",
     "NewickFormatError",
+    "NexusFormatError",
     "JplaceFormatError",
     "OrdinationFormatError",
     "PhylipFormatError",
@@ -380,6 +384,7 @@ import_module("skbio.io.format.fasta")
 import_module("skbio.io.format.fastq")
 import_module("skbio.io.format.lsmat")
 import_module("skbio.io.format.newick")
+import_module("skbio.io.format.nexus")
 import_module("skbio.io.format.jplace")
 import_module("skbio.io.format.ordination")
 import_module("skbio.io.format.phylip")
