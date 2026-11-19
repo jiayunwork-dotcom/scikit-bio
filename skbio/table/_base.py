@@ -36,3 +36,30 @@ def _table_to_numpy(table):
         counts = table.matrix_data.T.toarray()
 
     return counts, sample_ids, obs_ids
+
+
+def _table_to_sparse(table):
+    """Convert a Table to a sparse sample-by-observation CSR matrix.
+
+    The BIOM table stores observations as rows and samples as columns in CSC
+    form; transposing gives a CSR matrix whose rows are samples and whose
+    columns are observations (taxa), matching the convention used for direct
+    SciPy sparse inputs. The table is never densified.
+
+    Returns
+    -------
+    counts : scipy.sparse.csr_matrix of shape (n_samples, n_observations)
+    sample_ids : list of str
+    obs_ids : list of str
+
+    """
+    sample_ids = list(table.ids())
+    obs_ids = list(table.ids(axis="observation"))
+
+    if table.is_empty():
+        counts = table.matrix_data.T.tocsr()
+    else:
+        # matrix_data is CSC with observations on rows and samples on columns.
+        counts = table.matrix_data.T.tocsr()
+
+    return counts, sample_ids, obs_ids

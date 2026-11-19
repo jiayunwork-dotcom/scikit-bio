@@ -156,6 +156,49 @@ following conditions are also confirmed:
 * all tip names in the provided tree are unique
 * all provided taxa correspond to tip names in the provided tree
 
+Sparse count tables
+^^^^^^^^^^^^^^^^^^^^
+
+Microbial count tables are typically very wide (hundreds of thousands of taxa)
+but extremely sparse: each sample usually contains only a few dozen observed
+taxa. The phylogenetic metrics accept sparse inputs without ever expanding
+them into a dense sample-by-taxon or sample-by-node matrix:
+
+* :func:`~skbio.diversity.alpha.alpha_diversity` with ``metric='faith_pd'``
+  (or ``'phydiv'``);
+* :func:`~skbio.diversity.beta.beta_diversity` with
+  ``metric='unweighted_unifrac'`` or ``metric='weighted_unifrac'`` (both
+  ``normalized=False`` and ``normalized=True``);
+* the single-sample functions
+  :func:`~skbio.diversity.alpha.faith_pd`,
+  :func:`~skbio.diversity.beta.unweighted_unifrac` and
+  :func:`~skbio.diversity.beta.weighted_unifrac`.
+
+Accepted sparse inputs are a two-dimensional
+:class:`scipy.sparse.csr_matrix` or :class:`scipy.sparse.csr_array` (rows are
+samples, columns are taxa), and a BIOM :class:`~skbio.table.Table`, whose
+sample and observation axes supply the sample IDs and taxa. Explicitly
+provided ``ids`` and ``taxa`` still take precedence. A single community is
+represented by a **one-row** CSR table; multi-row CSR tables passed to the
+single-sample interfaces are rejected rather than silently flattened.
+
+Sparse storage may be non-canonical: column indices can be out of order, the
+same coordinate can occur repeatedly, and zeros can be stored explicitly. The
+logical value is the sum over repeated coordinates and an explicit zero does
+not denote presence. Stored values must be non-Boolean, real, finite,
+non-negative integers (floating-point integral values as produced by BIOM are
+accepted); negatives (even when canceled by a duplicate coordinate), NaN,
+infinity, fractional, complex and Boolean counts raise an error, and each
+row's logical total must not exceed ``2**53 - 1``. These count checks always
+run -- ``validate=False`` only skips the tree and label checks. The caller's
+sparse arrays, labels, BIOM data and tree are never modified.
+
+The sparse results are numerically identical to the dense pipeline's results
+on the same logical table. Sparse calls run under the default configuration,
+``engine='fast'`` and ``engine='cython'``. The Numba engine and a custom
+``pairwise_func`` do not support sparse inputs and raise a clear error before
+any computation; dense inputs follow the unchanged engine-selection rules.
+
 Count vectors
 ^^^^^^^^^^^^^
 

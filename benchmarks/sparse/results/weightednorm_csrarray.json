@@ -1,0 +1,24 @@
+{
+  "metric": "weighted_unifrac",
+  "normalized": true,
+  "input": "csr_array",
+  "clustered": false,
+  "seed": 20261119,
+  "n_tips": 200000,
+  "n_samples": 256,
+  "max_nnz_per_row": 32,
+  "stored_nonzeros": 8191,
+  "sparse_table_bytes": 99320,
+  "dense_equivalent_bytes": 409600000,
+  "output_shape": [
+    256,
+    256
+  ],
+  "output_bytes": 524288,
+  "build_seconds": 0.3697,
+  "metric_seconds": 11.3511,
+  "baseline_rss_mib": 647.55,
+  "peak_rss_mib": 657.29,
+  "peak_growth_mib": 9.73,
+  "within_256_mib": true
+}

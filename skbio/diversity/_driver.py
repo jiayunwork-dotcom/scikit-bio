@@ -33,6 +33,14 @@ from skbio.diversity._util import (
     _get_phylogenetic_kwargs,
     _qualify_counts,
 )
+from skbio.diversity._sparse import (
+    condensed_to_square,
+    faith_pd_sparse,
+    is_csr_counts,
+    phydiv_sparse,
+    unweighted_unifrac_sparse,
+    weighted_unifrac_sparse,
+)
 from skbio.util._decorator import deprecated
 from skbio.table._tabular import _ingest_table
 from skbio._config import _resolve_engine
@@ -153,13 +161,20 @@ def alpha_diversity(
         being used.
     counts : table_like of shape (n_samples, n_taxa) or (n_taxa,)
         Vector or matrix containing count/abundance data of one or multiple samples.
+        In addition to the dense table types, a two-dimensional
+        :class:`scipy.sparse.csr_matrix` or :class:`scipy.sparse.csr_array`
+        with samples on rows and taxa on columns, as well as a BIOM
+        :class:`~skbio.table.Table`, are accepted by the phylogenetic metrics
+        ``faith_pd`` and ``phydiv`` and are processed without densification.
     ids : array_like of shape (n_samples,), optional
         Identifiers for each sample in ``counts``. If not provided, will extract sample
         IDs from ``counts``, if available, or assign integer identifiers in the order
         that samples were provided.
     validate: bool, optional
         If True (default), validate the input data before applying the alpha diversity
-        metric. See :mod:`skbio.diversity` for the details of validation.
+        metric. See :mod:`skbio.diversity` for the details of validation. Sparse count
+        value checks (non-negative finite integers, row-total bound) always run, even
+        when this is False.
     kwargs : dict, optional
         Metric-specific parameters. Refer to the documentation of the chosen metric.
         A special parameter is ``taxa``, needed by some phylogenetic metrics. If not
@@ -177,7 +192,8 @@ def alpha_diversity(
     ValueError, MissingNodeError, DuplicateNodeError
         If validation fails. Exact error will depend on what was invalid.
     TypeError
-        If invalid method-specific parameters are provided.
+        If invalid method-specific parameters are provided, or if a sparse
+        count table is passed to a metric that does not support sparse input.
 
     See Also
     --------
@@ -187,7 +203,46 @@ def alpha_diversity(
 
     """
     taxa = kwargs.pop("taxa", None)
-    counts, ids, taxa = _ingest_table(counts, ids, taxa)
+    # The phylogenetic metrics have a sparse-aware path; every other alpha
+    # metric iterates rows of a dense counts matrix, so only enable sparse
+    # ingestion when one of them was requested.
+    sparse_eligible = metric in ("faith_pd", "phydiv")
+    counts, ids, taxa = _ingest_table(
+        counts, ids, taxa, allow_sparse=sparse_eligible
+    )
+    sparse_input = is_csr_counts(counts)
+
+    if sparse_input:
+        if not sparse_eligible:
+            raise TypeError(
+                f"Metric {metric!r} does not support sparse count tables; "
+                "pass a dense counts table instead."
+            )
+        # Count-value validation is unconditional; tree/label validation is
+        # still governed by `validate` below.
+        from skbio.diversity._util import (
+            _validate_sparse_counts_matrix,
+            build_sparse_phylogenetic_state,
+        )
+
+        counts = _validate_sparse_counts_matrix(counts, validate)
+        taxa, tree, kwargs = _get_phylogenetic_kwargs(kwargs, taxa)
+        is_faith_pd = metric == "faith_pd"
+        if validate:
+            from skbio.tree._utils import _validate_taxa_and_tree
+
+            _validate_taxa_and_tree(
+                taxa, tree, rooted=is_faith_pd, lengths=True
+            )
+        state = build_sparse_phylogenetic_state(counts, taxa, tree)
+        if is_faith_pd:
+            results = faith_pd_sparse(
+                state["node_counts"], state["branch_lengths"]
+            )
+        else:
+            results = _sparse_phydiv(state, tree, kwargs)
+        return pd.Series(np.asarray(results), index=ids)
+
     if validate:
         counts = _validate_counts_matrix(counts)
 
@@ -237,6 +292,25 @@ def alpha_diversity(
 _UNIFRAC_FAST_ENGINE = "numba" if NUMBA_AVAILABLE else "cython"
 
 
+def _sparse_phydiv(state, tree, kwargs):
+    """Sparse counterpart of the dense ``phydiv`` branch in alpha_diversity."""
+    rooted = kwargs.pop("rooted", tree._is_rooted())
+    weight = kwargs.pop("weight", False)
+    if (
+        not isinstance(weight, (bool, int, float))
+        or (w_ := float(weight)) < 0.0
+        or w_ > 1.0
+    ):
+        raise ValueError("Weight parameter must be Boolean or within [0, 1].")
+    return phydiv_sparse(
+        state["node_counts"],
+        state["branch_lengths"],
+        state["sample_totals"],
+        rooted,
+        weight,
+    )
+
+
 def _numba_unifrac_fast_path_eligible(engine, pairwise_func, kwargs):
     """Whether beta_diversity's numba unifrac kernels can be used as-is.
 
@@ -263,6 +337,101 @@ def _numba_unifrac_fast_path_eligible(engine, pairwise_func, kwargs):
     return False
 
 
+def _sparse_unifrac_engine_check(engine, pairwise_func):
+    """Reject the unsupported sparse combinations before any computation.
+
+    The sparse pipeline has its own kernels and never densifies, so neither a
+    caller-supplied ``pairwise_func`` nor the Numba engine can be applied to
+    it. Both are reported up front instead of silently ignoring the request or
+    falling back to the dense engine (which would defeat the purpose).
+
+    The global default engine may be ``numba``; only an *explicit* numba
+    request is an error, so sparse calls with the default config and with
+    ``engine='fast'`` both run on the sparse (cython) pipeline.
+    """
+    if pairwise_func is not None:
+        raise ValueError(
+            "A custom pairwise_func is not supported for sparse count inputs; "
+            "the sparse UniFrac pipeline provides its own pairwise computation."
+        )
+    if engine == "numba":
+        raise ValueError(
+            "engine='numba' is not supported for sparse count inputs; use "
+            "engine='cython' or engine='fast' (which runs the sparse "
+            "pipeline). The default configuration also uses the sparse "
+            "pipeline automatically."
+        )
+    # Resolve only to validate unknown engine strings; the result is
+    # intentionally unused because there is a single sparse implementation.
+    _resolve_engine(
+        engine, ("cython", "numba"), fast=_UNIFRAC_FAST_ENGINE
+    )
+    return "cython"
+
+
+def _beta_diversity_sparse(
+    metric, counts, ids, taxa, validate, pairwise_func, engine, kwargs
+):
+    """Sparse implementation of the phylogenetic beta metrics."""
+    from skbio.diversity._util import (
+        _validate_sparse_counts_matrix,
+        build_sparse_phylogenetic_state,
+    )
+    from skbio.diversity._phylogenetic import _tip_distances
+    from skbio.tree._utils import _validate_taxa_and_tree
+
+    # Count-value checks are unconditional even when validate=False.
+    counts = _validate_sparse_counts_matrix(counts, validate)
+
+    taxa, tree, kwargs = _get_phylogenetic_kwargs(kwargs, taxa)
+    if validate:
+        _validate_taxa_and_tree(taxa, tree, rooted=True, lengths=True)
+
+    _sparse_unifrac_engine_check(engine, pairwise_func)
+
+    state = build_sparse_phylogenetic_state(counts, taxa, tree)
+    node_counts = state["node_counts"]
+    branch_lengths = state["branch_lengths"]
+    tip_indices = state["tip_indices"]
+
+    if metric == "unweighted_unifrac":
+        condensed = unweighted_unifrac_sparse(node_counts, branch_lengths)
+    elif metric == "weighted_unifrac":
+        normalized = kwargs.pop(
+            "normalized", _normalize_weighted_unifrac_by_default
+        )
+        if kwargs:
+            raise ValueError(
+                f"Unrecognized keyword argument(s) for weighted_unifrac: "
+                f"{sorted(kwargs)}."
+            )
+        if normalized:
+            node_to_root = np.asarray(
+                _tip_distances(
+                    np.asarray(branch_lengths, dtype=np.float64),
+                    tree,
+                    tip_indices,
+                )
+            ).ravel()
+        else:
+            node_to_root = None
+        condensed = weighted_unifrac_sparse(
+            node_counts,
+            branch_lengths,
+            tip_indices,
+            normalized,
+            node_to_root,
+        )
+    else:  # pragma: no cover - guarded by the allow_sparse eligibility check
+        raise ValueError(
+            f"Metric {metric!r} does not support sparse count tables."
+        )
+
+    n_samples = counts.shape[0]
+    square = condensed_to_square(condensed, n_samples)
+    return DistanceMatrix(square, ids)
+
+
 def beta_diversity(
     metric: str | Callable,
     counts: TableLike,
@@ -284,13 +453,22 @@ def beta_diversity(
         metric being used.
     counts : table_like of shape (n_samples, n_taxa) or (n_taxa,)
         Vector or matrix containing count/abundance data of one or multiple samples.
+        In addition to the dense table types, a two-dimensional
+        :class:`scipy.sparse.csr_matrix` / :class:`scipy.sparse.csr_array`
+        with samples on rows and taxa on columns, and a BIOM
+        :class:`~skbio.table.Table`, are accepted by ``unweighted_unifrac``
+        and ``weighted_unifrac`` and processed without densification. Sparse
+        inputs support the default engine, ``engine='fast'`` and
+        ``engine='cython'``; ``engine='numba'`` and a custom
+        ``pairwise_func`` raise before any computation.
     ids : array_like of shape (n_samples,), optional
         Identifiers for each sample in ``counts``. If not provided, will extract sample
         IDs from ``counts``, if available, or assign integer identifiers in the order
         that samples were provided.
     validate: bool, optional
         If True (default), validate the input data before applying the alpha diversity
-        metric. See :mod:`skbio.diversity` for the details of validation.
+        metric. See :mod:`skbio.diversity` for the details of validation. Sparse count
+        value checks always run, even when this is False.
     pairwise_func : callable, optional
         The function to use for computing pairwise distances. Must take ``counts`` and
         ``metric`` and return a square, hollow, 2-D float array of dissimilarities.
@@ -320,6 +498,8 @@ def beta_diversity(
     ------
     ValueError, MissingNodeError, DuplicateNodeError
         If validation fails. Exact error will depend on what was invalid.
+        ValueError is also raised for sparse inputs combined with
+        ``engine='numba'`` or a custom ``pairwise_func``.
     Any Exception
         If invalid method-specific parameters are provided.
 
@@ -333,13 +513,30 @@ def beta_diversity(
 
     """
     taxa = kwargs.pop("taxa", None)
-    counts, ids, taxa = _ingest_table(counts, ids, taxa)
+    sparse_eligible = metric in ("unweighted_unifrac", "weighted_unifrac")
+    counts, ids, taxa = _ingest_table(
+        counts, ids, taxa, allow_sparse=sparse_eligible
+    )
+    sparse_input = is_csr_counts(counts)
     if 0 in counts.shape:
         # if the input counts are empty, return an empty DistanceMatrix.
         # this check is not necessary for scipy.spatial.distance.pdist but
-        # it is necessary for sklearn.metrics.pairwise_distances where the
+        # it is necessary for sklearn.metric.pairwise_distances where the
         # latter raises an exception over empty data.
         return DistanceMatrix(np.zeros((len(ids), len(ids))), ids)
+
+    if sparse_input:
+        return _beta_diversity_sparse(
+            metric,
+            counts,
+            ids,
+            taxa,
+            validate,
+            pairwise_func,
+            engine,
+            kwargs,
+        )
+
     if validate:
         counts = _validate_counts_matrix(counts)
     if metric in _qualitative_metrics:

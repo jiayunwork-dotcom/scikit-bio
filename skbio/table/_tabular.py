@@ -12,7 +12,7 @@ from collections.abc import Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-from ._base import _table_to_numpy
+from ._base import _table_to_numpy, _table_to_sparse
 from skbio._config import get_config
 from skbio.util import get_package
 from skbio.util._array import _to_numpy
@@ -132,7 +132,8 @@ def _extract_row_ids(input_data, warn_ids=False):
         return list(range(input_data.shape[0]))
 
 
-def _ingest_table(table, sample_ids=None, feature_ids=None, expand=True):
+def _ingest_table(table, sample_ids=None, feature_ids=None, expand=True,
+                  allow_sparse=False):
     """Process an input data table into individual components.
 
     Parameters
@@ -150,10 +151,18 @@ def _ingest_table(table, sample_ids=None, feature_ids=None, expand=True):
     expand : bool, optional
         If table has only one dimension and this parameter is True, expand the data to
         two dimensions (i.e., a single-row matrix). Otherwise, raise an error.
+    allow_sparse : bool, optional
+        If True, keep sparse inputs sparse. A 2-D
+        :class:`scipy.sparse.csr_matrix` / :class:`scipy.sparse.csr_array` is
+        returned as a CSR matrix with rows as samples and columns as features,
+        and a BIOM :class:`~skbio.table.Table` is converted through its sparse
+        (CSC/CSR) representation rather than expanded to a dense array.
+        Default False preserves the historical dense behavior for all other
+        callers.
 
     Returns
     -------
-    data : ndarray of shape (n_samples, n_features)
+    data : ndarray or scipy.sparse.csr_matrix of shape (n_samples, n_features)
         The raw numeric values from the input data.
     sample_ids : list of str
         The extracted or provided sample IDs.
@@ -168,10 +177,25 @@ def _ingest_table(table, sample_ids=None, feature_ids=None, expand=True):
         If number of provided sample/feature IDs doesn't match table dimensions.
 
     """
+    import scipy.sparse as _sp
+
     data, samples, features = None, None, None
 
+    # Sparse CSR input (scipy.sparse.csr_matrix or csr_array). Rows are
+    # samples and columns are features/taxa.
+    if allow_sparse and (
+        _sp.isspmatrix_csr(table) or isinstance(table, _sp.csr_array)
+    ):
+        if _sp.isspmatrix_csr(table):
+            data = table
+        else:
+            # csr_array shares the CSR data model but is not an ndarray-like
+            # matrix subclass; normalize to a csr_matrix for the rest of the
+            # pipeline without densifying.
+            data = _sp.csr_matrix(table)
+
     # Python (nested) list, tuple, etc.
-    if isinstance(table, Sequence) and not isinstance(table, (str, bytes)):
+    elif isinstance(table, Sequence) and not isinstance(table, (str, bytes)):
         data = np.asarray(table)
 
     # NumPy array
@@ -191,7 +215,10 @@ def _ingest_table(table, sample_ids=None, feature_ids=None, expand=True):
         from skbio.table import Table
 
         if isinstance(table, Table):
-            data, samples, features = _table_to_numpy(table)
+            if allow_sparse:
+                data, samples, features = _table_to_sparse(table)
+            else:
+                data, samples, features = _table_to_numpy(table)
 
     # Polars DataFrame
     # Can't do an explicit check until polars is imported, so check for schema first.
@@ -212,6 +239,18 @@ def _ingest_table(table, sample_ids=None, feature_ids=None, expand=True):
     # array-like object
     # this will generate a NumPy array, regardless of input type
     if data is None:
+        # Sparse tables are supported only through the explicit allow_sparse
+        # path; refuse them here rather than letting np.asarray produce an
+        # object array whose failure mode is an opaque message.
+        if (
+            _sp.issparse(table)
+            or isinstance(table, _sp.sparray)
+        ):
+            raise TypeError(
+                f"'{table.__class__.__name__}' is not a supported table "
+                "format for this operation; the phylogenetic diversity "
+                "metrics accept sparse CSR input directly."
+            )
         data = np.asarray(table)
 
     # zero-dimensional arrays are considered as invalid (such as scalars, non-
@@ -238,7 +277,6 @@ def _ingest_table(table, sample_ids=None, feature_ids=None, expand=True):
         raise ValueError(lenerr.format(data.shape[1], "feature", len(feature_ids)))
 
     return data, sample_ids, feature_ids
-
 
 def _aggregate_features(data, aggregator, features=None):
     """Aggregate features in a data table.

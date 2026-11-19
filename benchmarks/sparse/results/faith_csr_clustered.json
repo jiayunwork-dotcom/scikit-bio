@@ -1,0 +1,23 @@
+{
+  "metric": "faith_pd",
+  "normalized": false,
+  "input": "csr",
+  "clustered": true,
+  "seed": 20261119,
+  "n_tips": 200000,
+  "n_samples": 256,
+  "max_nnz_per_row": 32,
+  "stored_nonzeros": 8161,
+  "sparse_table_bytes": 98960,
+  "dense_equivalent_bytes": 409600000,
+  "output_shape": [
+    256
+  ],
+  "output_bytes": 2048,
+  "build_seconds": 0.4378,
+  "metric_seconds": 0.7596,
+  "baseline_rss_mib": 646.94,
+  "peak_rss_mib": 655.86,
+  "peak_growth_mib": 8.92,
+  "within_256_mib": true
+}

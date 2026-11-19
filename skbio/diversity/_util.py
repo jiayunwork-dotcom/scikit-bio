@@ -10,6 +10,11 @@ import numpy as np
 
 from skbio.tree import DuplicateNodeError, MissingNodeError
 from skbio.diversity._phylogenetic import _nodes_by_counts
+from skbio.diversity._sparse import (
+    build_ancestor_matrix,
+    sparse_counts_by_node,
+    validate_sparse_counts,
+)
 
 
 def _validate_counts(counts, cast_int=False):
@@ -183,3 +188,73 @@ def _get_phylogenetic_kwargs(kwargs, taxa):
 
 def _qualify_counts(counts):
     return counts > 0.0
+
+
+def _validate_sparse_counts_matrix(counts, validate=True):
+    """Validate a sparse count table.
+
+    The count-value checks (dtype, finiteness, non-negativity, integrality,
+    row-total bound) always run: they are independent of ``validate`` and must
+    not be bypassed by ``validate=False`` (which only skips the tree/label
+    checks at the call site). The ``validate`` argument is accepted for call
+    signature symmetry with the dense validator but deliberately not used
+    here. A canonicalized CSR **copy** is returned, so downstream
+    sorting/merging never mutates the caller's data.
+
+    """
+    return validate_sparse_counts(counts)
+
+
+def build_sparse_phylogenetic_state(counts, taxa, tree):
+    """Build the reusable sparse state behind all phylogenetic metrics.
+
+    Parameters
+    ----------
+    counts : scipy.sparse.csr_matrix, shape (n_samples, n_taxa)
+        Already-validated canonical CSR counts (see
+        :func:`_validate_sparse_counts_matrix`).
+    taxa : array_like, shape (n_taxa,)
+        Taxon label per table column.
+    tree : skbio.tree.TreeNode
+        Tree relating the taxa. Tip names may be a superset of the taxa.
+
+    Returns
+    -------
+    dict
+        ``node_counts`` (CSC sparse ``n_nodes x n_samples`` per-node counts),
+        ``branch_lengths`` (float64 per node), ``tree_index`` (the indexed
+        tree), ``tip_indices`` and ``sample_totals`` (float64 per sample).
+
+    Notes
+    -----
+    The tree is indexed with :meth:`TreeNode.to_array` exactly as in the dense
+    pipeline, so the mapping from taxon labels to tip nodes and the branch
+    lengths are identical to the dense results. No dense sample-by-taxon or
+    sample-by-node matrix is allocated: the only dense outputs are the
+    one-dimensional per-node and per-sample vectors, plus the final distance
+    matrix produced by the caller.
+
+    """
+    import numpy as np
+
+    tree_index = tree.to_array(nan_length_value=0.0)
+    branch_lengths = tree_index["length"]
+    ancestor = build_ancestor_matrix(tree_index)
+    node_counts = sparse_counts_by_node(counts, taxa, tree_index, ancestor)
+
+    # Tip indices in node order (postorder ids), matching _get_tip_indices.
+    tip_indices = np.array(
+        [n.id for n in tree_index["id_index"].values() if n.is_tip()],
+        dtype=np.intp,
+    )
+    sample_totals = np.asarray(
+        node_counts[tip_indices, :].sum(axis=0)
+    ).ravel().astype(np.float64, copy=False)
+
+    return {
+        "node_counts": node_counts,
+        "branch_lengths": branch_lengths,
+        "tree_index": tree_index,
+        "tip_indices": tip_indices,
+        "sample_totals": sample_totals,
+    }

@@ -1,0 +1,23 @@
+{
+  "metric": "faith_pd",
+  "normalized": false,
+  "input": "biom",
+  "clustered": false,
+  "seed": 20261119,
+  "n_tips": 200000,
+  "n_samples": 256,
+  "max_nnz_per_row": 32,
+  "stored_nonzeros": 8191,
+  "sparse_table_bytes": 99320,
+  "dense_equivalent_bytes": 409600000,
+  "output_shape": [
+    256
+  ],
+  "output_bytes": 2048,
+  "build_seconds": 0.3489,
+  "metric_seconds": 0.6738,
+  "baseline_rss_mib": 660.75,
+  "peak_rss_mib": 674.03,
+  "peak_growth_mib": 13.28,
+  "within_256_mib": true
+}

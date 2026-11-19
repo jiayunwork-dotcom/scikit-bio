@@ -12,6 +12,7 @@ import numpy as np
 import numpy.testing as npt
 import pandas as pd
 import pandas.testing as pdt
+import scipy.sparse as sp
 
 from skbio._config import set_config
 from skbio.table import Table
@@ -497,6 +498,71 @@ class TestBIOM(TestCase):
         npt.assert_array_equal(data, self.data)
         self.assertEqual(row_ids, self.samples)
         self.assertEqual(col_ids, self.features)
+
+    def test_biom_sparse_ingest(self):
+        tbl = Table(
+            self.data.T, observation_ids=self.features, sample_ids=self.samples
+        )
+        data, row_ids, col_ids = _ingest_table(tbl, allow_sparse=True)
+        self.assertTrue(sp.isspmatrix_csr(data))
+        npt.assert_array_equal(data.toarray(), self.data)
+        self.assertEqual(row_ids, self.samples)
+        self.assertEqual(col_ids, self.features)
+
+    def test_biom_sparse_ingest_does_not_densify(self):
+        wide = np.zeros((2, 1000))
+        wide[0, 0] = 1.0
+        wide[1, -1] = 2.0
+        tbl = Table(
+            wide.T,
+            observation_ids=[f"f{i}" for i in range(1000)],
+            sample_ids=["A", "B"],
+        )
+        data, _, _ = _ingest_table(tbl, allow_sparse=True)
+        self.assertTrue(sp.isspmatrix_csr(data))
+        self.assertEqual(data.nnz, 2)
+        self.assertEqual(data.shape, (2, 1000))
+
+
+class TestSparseIngest(TestCase):
+    def setUp(self):
+        self.data = np.array([[0, 1, 2], [3, 0, 0], [0, 0, 8]])
+        self.samples = ["A", "B", "C"]
+        self.features = ["f1", "f2", "f3"]
+
+    def test_csr_matrix_kept_sparse(self):
+        table = sp.csr_matrix(self.data)
+        data, samples, features = _ingest_table(
+            table, allow_sparse=True
+        )
+        self.assertTrue(sp.isspmatrix_csr(data))
+        npt.assert_array_equal(data.toarray(), self.data)
+        self.assertIsNone(samples)
+        self.assertIsNone(features)
+
+    def test_csr_array_kept_sparse(self):
+        table = sp.csr_array(self.data)
+        data, _, _ = _ingest_table(table, allow_sparse=True)
+        self.assertTrue(sp.isspmatrix_csr(data))
+        npt.assert_array_equal(data.toarray(), self.data)
+
+    def test_sparse_ids_override_and_validation(self):
+        table = sp.csr_matrix(self.data)
+        data, samples, features = _ingest_table(
+            table, self.samples, self.features, allow_sparse=True
+        )
+        npt.assert_array_equal(data.toarray(), self.data)
+        self.assertEqual(samples, self.samples)
+        self.assertEqual(features, self.features)
+        with self.assertRaises(ValueError):
+            _ingest_table(
+                table, ["only"], self.features, allow_sparse=True
+            )
+
+    def test_sparse_rejected_without_flag(self):
+        table = sp.csr_matrix(self.data)
+        with self.assertRaises(TypeError):
+            _ingest_table(table)
 
 
 @skipIf(adt is None, "Anndata is not available for unit tests.")

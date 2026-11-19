@@ -1,0 +1,24 @@
+{
+  "metric": "unweighted_unifrac",
+  "normalized": false,
+  "input": "biom",
+  "clustered": false,
+  "seed": 20261119,
+  "n_tips": 200000,
+  "n_samples": 256,
+  "max_nnz_per_row": 32,
+  "stored_nonzeros": 8191,
+  "sparse_table_bytes": 99320,
+  "dense_equivalent_bytes": 409600000,
+  "output_shape": [
+    256,
+    256
+  ],
+  "output_bytes": 524288,
+  "build_seconds": 0.3499,
+  "metric_seconds": 0.6653,
+  "baseline_rss_mib": 660.94,
+  "peak_rss_mib": 673.39,
+  "peak_growth_mib": 12.45,
+  "within_256_mib": true
+}

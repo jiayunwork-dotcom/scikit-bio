@@ -15,6 +15,14 @@ from skbio.diversity._util import (
     vectorize_counts_and_tree,
 )
 from skbio.diversity._phylogenetic import _tip_distances
+from skbio.diversity._sparse import (
+    build_ancestor_matrix,
+    is_csr_counts,
+    sparse_counts_by_node,
+    unweighted_unifrac_sparse,
+    validate_sparse_counts,
+    weighted_unifrac_sparse,
+)
 from skbio.util._decorator import params_aliased
 from skbio.tree._utils import _validate_taxa_and_tree
 
@@ -39,9 +47,12 @@ def unweighted_unifrac(u_counts, v_counts, taxa, tree, validate=True):
 
     Parameters
     ----------
-    u_counts, v_counts: list, np.array
+    u_counts, v_counts: list, np.array, or one-row CSR matrix/array
         Vectors of counts/abundances of taxa for two samples. Must be equal
-        length.
+        length. A single community may be given as a one-row
+        :class:`scipy.sparse.csr_matrix` / :class:`scipy.sparse.csr_array`;
+        both inputs must then be one-row sparse tables and multi-row tables
+        are rejected rather than flattened.
     taxa : list, np.array
         Vector of taxon IDs corresponding to tip names in ``tree``. Must be the
         same length as ``u_counts`` and ``v_counts``. Required.
@@ -55,7 +66,8 @@ def unweighted_unifrac(u_counts, v_counts, taxa, tree, validate=True):
         messages that are hard to interpret, so this step should not be
         bypassed if you're not certain that your input data are valid. See
         :mod:`skbio.diversity` for the description of what validation entails
-        so you can determine if you can safely disable validation.
+        so you can determine if you can safely disable validation. Sparse
+        count-value checks always run, even when this is False.
 
     Returns
     -------
@@ -154,10 +166,15 @@ def unweighted_unifrac(u_counts, v_counts, taxa, tree, validate=True):
     0.37
 
     """
-    u_node_counts, v_node_counts, _, _, tree_index = _setup_pairwise_unifrac(
+    setup = _setup_pairwise_unifrac(
         u_counts, v_counts, taxa, tree, validate, normalized=False, unweighted=True
     )
-    return _unweighted_unifrac(u_node_counts, v_node_counts, tree_index["length"])
+    if isinstance(setup, dict):
+        return _pairwise_unifrac_sparse(setup)
+    u_node_counts, v_node_counts, _, _, tree_index = setup
+    return _unweighted_unifrac(
+        u_node_counts, v_node_counts, tree_index["length"]
+    )
 
 
 @params_aliased([("taxa", "otu_ids", "0.6.0", True)])
@@ -173,9 +190,12 @@ def weighted_unifrac(
 
     Parameters
     ----------
-    u_counts, v_counts: list, np.array
+    u_counts, v_counts: list, np.array, or one-row CSR matrix/array
         Vectors of counts/abundances of taxa for two samples. Must be equal
-        length.
+        length. A single community may be given as a one-row
+        :class:`scipy.sparse.csr_matrix` / :class:`scipy.sparse.csr_array`;
+        both inputs must then be one-row sparse tables and multi-row tables
+        are rejected rather than flattened.
     taxa : list, np.array
         Vector of taxon IDs corresponding to tip names in ``tree``. Must be the
         same length as ``u_counts`` and ``v_counts``. Required.
@@ -192,7 +212,8 @@ def weighted_unifrac(
         messages that are hard to interpret, so this step should not be
         bypassed if you're not certain that your input data are valid. See
         :mod:`skbio.diversity` for the description of what validation entails
-        so you can determine if you can safely disable validation.
+        so you can determine if you can safely disable validation. Sparse
+        count-value checks always run, even when this is False.
 
     Returns
     -------
@@ -293,13 +314,7 @@ def weighted_unifrac(
     0.33
 
     """
-    (
-        u_node_counts,
-        v_node_counts,
-        u_total_count,
-        v_total_count,
-        tree_index,
-    ) = _setup_pairwise_unifrac(
+    setup = _setup_pairwise_unifrac(
         u_counts,
         v_counts,
         taxa,
@@ -308,6 +323,15 @@ def weighted_unifrac(
         normalized=normalized,
         unweighted=False,
     )
+    if isinstance(setup, dict):
+        return _pairwise_unifrac_sparse(setup)
+    (
+        u_node_counts,
+        v_node_counts,
+        u_total_count,
+        v_total_count,
+        tree_index,
+    ) = setup
     branch_lengths = tree_index["length"]
 
     if normalized:
@@ -330,6 +354,11 @@ def weighted_unifrac(
 def _setup_pairwise_unifrac(
     u_counts, v_counts, taxa, tree, validate, normalized, unweighted
 ):
+    if is_csr_counts(u_counts) or is_csr_counts(v_counts):
+        return _setup_pairwise_unifrac_sparse(
+            u_counts, v_counts, taxa, tree, validate, normalized, unweighted
+        )
+
     if validate:
         counts = _validate_counts_matrix([u_counts, v_counts], cast_int=False)
         if counts.shape[1] != len(taxa):
@@ -342,6 +371,85 @@ def _setup_pairwise_unifrac(
     )
     total_counts = counts.sum(axis=1)
     return (*counts_by_node, *total_counts, tree_index)
+
+
+def _setup_pairwise_unifrac_sparse(
+    u_counts, v_counts, taxa, tree, validate, normalized, unweighted
+):
+    """Sparse pairwise setup: both communities must be one-row CSR tables.
+
+    A multi-row CSR is rejected here instead of being silently flattened, and
+    a mix of sparse and dense inputs is rejected so the two communities are
+    interpreted through one consistent code path. Count-value validation
+    always runs; tree/label checks honor ``validate``.
+    """
+    if not (is_csr_counts(u_counts) and is_csr_counts(v_counts)):
+        raise TypeError(
+            "When one UniFrac input is sparse, both must be one-row CSR "
+            "matrices/arrays; got a mix of sparse and dense inputs."
+        )
+    for name, table in (("u_counts", u_counts), ("v_counts", v_counts)):
+        if table.ndim != 2 or table.shape[0] != 1:
+            raise ValueError(
+                f"`{name}` must be a CSR table with exactly one row; got "
+                f"shape {table.shape}."
+            )
+        if table.shape[1] != len(taxa):
+            raise ValueError("`taxa` must be the same length as `counts`.")
+
+    import scipy.sparse as sp
+
+    u_valid = validate_sparse_counts(u_counts)
+    v_valid = validate_sparse_counts(v_counts)
+    if validate:
+        _validate_taxa_and_tree(taxa, tree, rooted=True, lengths=True)
+
+    counts = sp.vstack([u_valid, v_valid]).tocsr()
+    tree_index = tree.to_array(nan_length_value=0.0)
+    ancestor = build_ancestor_matrix(tree_index)
+    node_counts = sparse_counts_by_node(counts, taxa, tree_index, ancestor)
+    tip_indices = np.array(
+        [n.id for n in tree_index["id_index"].values() if n.is_tip()],
+        dtype=np.intp,
+    )
+    return {
+        "node_counts": node_counts,
+        "tree_index": tree_index,
+        "branch_lengths": tree_index["length"],
+        "tip_indices": tip_indices,
+        "normalized": normalized,
+        "unweighted": unweighted,
+        "tree": tree,
+    }
+
+
+def _pairwise_unifrac_sparse(state):
+    """Run the appropriate sparse kernel on a two-sample state dict."""
+    node_counts = state["node_counts"]
+    branch_lengths = state["branch_lengths"]
+    tip_indices = state["tip_indices"]
+    if state["unweighted"]:
+        condensed = unweighted_unifrac_sparse(node_counts, branch_lengths)
+    else:
+        if state["normalized"]:
+            node_to_root = np.asarray(
+                _tip_distances(
+                    np.asarray(branch_lengths, dtype=np.float64),
+                    state["tree"],
+                    tip_indices,
+                )
+            ).ravel()
+        else:
+            node_to_root = None
+        condensed = weighted_unifrac_sparse(
+            node_counts,
+            branch_lengths,
+            tip_indices,
+            state["normalized"],
+            node_to_root,
+        )
+    # The condensed vector of a single pair is the scalar distance itself.
+    return float(condensed[0])
 
 
 def _unweighted_unifrac(u_node_counts, v_node_counts, branch_lengths):

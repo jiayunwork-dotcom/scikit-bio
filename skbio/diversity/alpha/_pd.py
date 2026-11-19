@@ -12,11 +12,22 @@ from skbio.diversity._util import (
     _validate_counts_vector,
     vectorize_counts_and_tree,
 )
+from skbio.diversity._sparse import (
+    build_ancestor_matrix,
+    faith_pd_sparse,
+    is_csr_counts,
+    phydiv_sparse,
+    sparse_counts_by_node,
+    validate_sparse_counts,
+)
 from skbio.tree._utils import _validate_taxa_and_tree
 from skbio.util._decorator import params_aliased
 
 
 def _setup_pd(counts, taxa, tree, validate, rooted, single_sample):
+    if is_csr_counts(counts):
+        return _setup_pd_sparse(counts, taxa, tree, validate, rooted)
+
     if validate:
         # Only validate count if operating in single sample mode, as they will have
         # already been validated otherwise.
@@ -29,6 +40,45 @@ def _setup_pd(counts, taxa, tree, validate, rooted, single_sample):
     counts_by_node, _, branch_lengths = vectorize_counts_and_tree(counts, taxa, tree)
 
     return counts_by_node, branch_lengths
+
+
+def _setup_pd_sparse(counts, taxa, tree, validate, rooted):
+    """Sparse counterpart of ``_setup_pd``; returns a sparse state dict.
+
+    Count-value validation always runs; the tree/label checks honor
+    ``validate`` exactly as in the dense path. A multi-row CSR is rejected so
+    the single-sample interface can never silently flatten a batch table.
+    """
+    if counts.ndim != 2 or counts.shape[0] != 1:
+        raise ValueError(
+            "The single-sample interface requires a CSR table with exactly "
+            f"one row; got shape {counts.shape}."
+        )
+    counts = validate_sparse_counts(counts)
+    if counts.shape[1] != len(taxa):
+        raise ValueError("`taxa` must be the same length as `counts`.")
+    if validate:
+        _validate_taxa_and_tree(taxa, tree, rooted=rooted, lengths=True)
+
+    tree_index = tree.to_array(nan_length_value=0.0)
+    ancestor = build_ancestor_matrix(tree_index)
+    node_counts = sparse_counts_by_node(counts, taxa, tree_index, ancestor)
+    # The sample total is the sum over TIP counts only; summing all node
+    # counts would count every tip once per ancestor.
+    tip_indices = np.array(
+        [n.id for n in tree_index["id_index"].values() if n.is_tip()],
+        dtype=np.intp,
+    )
+    sample_totals = np.asarray(
+        node_counts[tip_indices, :].sum(axis=0)
+    ).ravel().astype(np.float64, copy=False)
+    return {
+        "node_counts": node_counts,
+        "branch_lengths": tree_index["length"],
+        "tree_index": tree_index,
+        "tip_indices": tip_indices,
+        "sample_totals": sample_totals,
+    }
 
 
 def _faith_pd(counts_by_node, branch_lengths):
@@ -67,8 +117,11 @@ def faith_pd(counts, taxa, tree, validate=True):
 
     Parameters
     ----------
-    counts : 1-D array_like, int
-        Vectors of counts/abundances of taxa for one sample.
+    counts : 1-D array_like, int, or a one-row CSR matrix/array
+        Vectors of counts/abundances of taxa for one sample. A single
+        community may also be provided as a one-row
+        :class:`scipy.sparse.csr_matrix` / :class:`scipy.sparse.csr_array`;
+        multi-row sparse tables are rejected rather than flattened.
     taxa : list, np.array
         Vector of taxon IDs corresponding to tip names in ``tree``. Must be the same
         length as ``counts``. Required.
@@ -81,7 +134,8 @@ def faith_pd(counts, taxa, tree, validate=True):
         data can lead to invalid results or error messages that are hard to interpret,
         so this step should not be bypassed if you're not certain that your input data
         are valid. See :mod:`skbio.diversity` for the description of what validation
-        entails so you can determine if you can safely disable validation.
+        entails so you can determine if you can safely disable validation. Sparse
+        count-value checks always run, even when this is False.
 
     Returns
     -------
@@ -181,9 +235,15 @@ def faith_pd(counts, taxa, tree, validate=True):
     6.95
 
     """
-    counts_by_node, branch_lengths = _setup_pd(
+    state = _setup_pd(
         counts, taxa, tree, validate, rooted=True, single_sample=True
     )
+    if isinstance(state, dict):
+        result = faith_pd_sparse(
+            state["node_counts"], state["branch_lengths"]
+        )[0]
+        return float(result)
+    counts_by_node, branch_lengths = state
     return _faith_pd(counts_by_node, branch_lengths)
 
 
@@ -426,7 +486,7 @@ def phydiv(counts, taxa, tree, rooted=None, weight=False, validate=True):
     """
     # whether tree is rooted should not affect whether metric can be calculated
     # ; it is common unrooted PD is calculated on a rooted tree
-    counts_by_node, branch_lengths = _setup_pd(
+    state = _setup_pd(
         counts, taxa, tree, validate, rooted=False, single_sample=True
     )
 
@@ -443,4 +503,15 @@ def phydiv(counts, taxa, tree, rooted=None, weight=False, validate=True):
     ):
         raise ValueError("Weight parameter must be Boolean or within [0, 1].")
 
+    if isinstance(state, dict):
+        return float(
+            phydiv_sparse(
+                state["node_counts"],
+                state["branch_lengths"],
+                state["sample_totals"],
+                rooted,
+                weight,
+            )[0]
+        )
+    counts_by_node, branch_lengths = state
     return _phydiv(counts_by_node, branch_lengths, rooted, weight)
