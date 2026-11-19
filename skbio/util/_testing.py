@@ -1,0 +1,791 @@
+# ----------------------------------------------------------------------------
+# Copyright (c) 2013--, scikit-bio development team.
+#
+# Distributed under the terms of the Modified BSD License.
+#
+# The full license is in the file LICENSE.txt, distributed with this software.
+# ----------------------------------------------------------------------------
+
+"""Testing utilities."""
+
+import inspect
+import os
+import sys
+import functools
+import unittest
+
+import numpy as np
+import numpy.testing as npt
+import pandas.testing as pdt
+from scipy.spatial.distance import pdist
+
+from skbio.util._array import _to_numpy, _move_to_device, _get_backend_name
+
+
+class ReallyEqualMixin:
+    """Use this for testing __eq__/__ne__.
+
+    Taken and modified from the following public domain code:
+      https://ludios.org/testing-your-eq-ne-cmp/
+
+    """
+
+    def assertReallyEqual(self, a, b):
+        # assertEqual first, because it will have a good message if the
+        # assertion fails.
+        self.assertEqual(a, b)
+        self.assertEqual(b, a)
+        self.assertTrue(a == b)
+        self.assertTrue(b == a)
+        self.assertFalse(a != b)
+        self.assertFalse(b != a)
+
+    def assertReallyNotEqual(self, a, b):
+        # assertNotEqual first, because it will have a good message if the
+        # assertion fails.
+        self.assertNotEqual(a, b)
+        self.assertNotEqual(b, a)
+        self.assertFalse(a == b)
+        self.assertFalse(b == a)
+        self.assertTrue(a != b)
+        self.assertTrue(b != a)
+
+
+def get_data_path(fn, subfolder="data"):
+    """Return path to filename ``fn`` in the data folder.
+
+    During testing it is often necessary to load data files. This
+    function returns the full path to files in the ``data`` subfolder
+    by default.
+
+    Parameters
+    ----------
+    fn : str
+        File name.
+
+    subfolder : str, defaults to ``data``
+        Name of the subfolder that contains the data.
+
+
+    Returns
+    -------
+    str
+        Inferred absolute path to the test data for the module where
+        ``get_data_path(fn)`` is called.
+
+    Notes
+    -----
+    The requested path may not point to an existing file, as its
+    existence is not checked.
+
+    """
+    # getouterframes returns a list of tuples: the second tuple
+    # contains info about the caller, and the second element is its
+    # filename
+    callers_filename = inspect.getouterframes(inspect.currentframe())[1][1]
+    path = os.path.dirname(os.path.abspath(callers_filename))
+    data_path = os.path.join(path, subfolder, fn)
+    return data_path
+
+
+def assert_ordination_results_equal(
+    left,
+    right,
+    ignore_method_names=False,
+    ignore_axis_labels=False,
+    ignore_directionality=False,
+    decimal=7,
+):
+    """Assert that ordination results objects are equal.
+
+    This is a helper function intended to be used in unit tests that need to
+    compare ``OrdinationResults`` objects.
+
+    Parameters
+    ----------
+    left, right : OrdinationResults
+        Ordination results to be compared for equality.
+    ignore_method_names : bool, optional
+        Ignore differences in `short_method_name` and `long_method_name`.
+    ignore_axis_labels : bool, optional
+        Ignore differences in axis labels (i.e., column labels).
+    ignore_directionality : bool, optional
+        Ignore differences in directionality (i.e., differences in signs) for
+        attributes `samples`, `features` and `biplot_scores`.
+    decimal : int, optional
+        Number of decimal places to compare when checking numerical values.
+        Defaults to 7.
+
+    Raises
+    ------
+    AssertionError
+        If the two objects are not equal.
+
+    """
+    npt.assert_equal(type(left) is type(right), True)
+
+    if not ignore_method_names:
+        npt.assert_equal(left.short_method_name, right.short_method_name)
+        npt.assert_equal(left.long_method_name, right.long_method_name)
+
+    _assert_frame_dists_equal(
+        left.samples,
+        right.samples,
+        ignore_columns=ignore_axis_labels,
+        ignore_directionality=ignore_directionality,
+        decimal=decimal,
+    )
+
+    _assert_frame_dists_equal(
+        left.features,
+        right.features,
+        ignore_columns=ignore_axis_labels,
+        ignore_directionality=ignore_directionality,
+        decimal=decimal,
+    )
+
+    _assert_frame_dists_equal(
+        left.biplot_scores,
+        right.biplot_scores,
+        ignore_columns=ignore_axis_labels,
+        ignore_directionality=ignore_directionality,
+        decimal=decimal,
+    )
+
+    _assert_frame_dists_equal(
+        left.sample_constraints,
+        right.sample_constraints,
+        ignore_columns=ignore_axis_labels,
+        ignore_directionality=ignore_directionality,
+        decimal=decimal,
+    )
+
+    _assert_series_equal(
+        left.eigvals, right.eigvals, ignore_axis_labels, decimal=decimal
+    )
+
+    _assert_series_equal(
+        left.proportion_explained,
+        right.proportion_explained,
+        ignore_axis_labels,
+        decimal=decimal,
+    )
+
+
+def assert_ordination_results_equal_np(obs, exp, ignore_method_names=False, decimal=7):
+    """NumPy version of testing ordination results."""
+    if not ignore_method_names:
+        npt.assert_equal(obs.short_method_name, exp.short_method_name)
+        npt.assert_equal(obs.long_method_name, exp.long_method_name)
+
+    # do this for samples, features, biplot_scores, sample_constraints
+    obs_dists_samp = pdist(obs.samples)
+    exp_dists_samp = pdist(exp.samples)
+    npt.assert_almost_equal(obs_dists_samp, exp_dists_samp, decimal=decimal)
+
+    # test features
+    if exp.features is None:
+        assert obs.features is None
+    else:
+        obs_dists_feat = pdist(obs.features)
+        exp_dists_feat = pdist(exp.features)
+        npt.assert_almost_equal(obs_dists_feat, exp_dists_feat, decimal=decimal)
+
+    # test biplot_scores
+    if exp.biplot_scores is None:
+        assert obs.biplot_scores is None
+    else:
+        obs_dists_biplot = pdist(obs.biplot_scores)
+        exp_dists_biplot = pdist(exp.biplot_scores)
+        npt.assert_almost_equal(obs_dists_biplot, exp_dists_biplot, decimal=decimal)
+
+    # test sample_constraints
+    if exp.sample_constraints is None:
+        assert obs.sample_constraints is None
+    else:
+        obs_dists_cons = pdist(obs.sample_constraints)
+        exp_dists_cons = pdist(exp.sample_constraints)
+        npt.assert_almost_equal(obs_dists_cons, exp_dists_cons, decimal=decimal)
+
+    # test eigvals
+    npt.assert_almost_equal(obs.eigvals, exp.eigvals, decimal=decimal)
+
+    # test proportion_explained
+    if exp.proportion_explained is None:
+        assert obs.proportion_explained is None
+    else:
+        npt.assert_almost_equal(
+            obs.proportion_explained, exp.proportion_explained, decimal=decimal
+        )
+
+
+def _assert_series_equal(left_s, right_s, ignore_index=False, decimal=7):
+    # assert_series_equal doesn't like None...
+    if left_s is None or right_s is None:
+        assert left_s is None and right_s is None
+    else:
+        npt.assert_almost_equal(left_s.values, right_s.values, decimal=decimal)
+        if not ignore_index:
+            pdt.assert_index_equal(left_s.index, right_s.index)
+
+
+def _assert_frame_dists_equal(
+    left_df,
+    right_df,
+    ignore_index=False,
+    ignore_columns=False,
+    ignore_directionality=False,
+    decimal=7,
+):
+    if left_df is None or right_df is None:
+        assert left_df is None and right_df is None
+    else:
+        left_values = left_df.values
+        right_values = right_df.values
+        left_dists = pdist(left_values)
+        right_dists = pdist(right_values)
+        npt.assert_almost_equal(left_dists, right_dists, decimal=decimal)
+
+        if not ignore_index:
+            pdt.assert_index_equal(left_df.index, right_df.index)
+        if not ignore_columns:
+            pdt.assert_index_equal(left_df.columns, right_df.columns)
+
+
+def _normalize_signs(arr1, arr2):
+    """Change column signs so that "column" and "-column" compare equal.
+
+    This is needed because results of eigenproblmes can have signs
+    flipped, but they're still right.
+
+    Notes
+    -----
+    This function tries hard to make sure that, if you find "column"
+    and "-column" almost equal, calling a function like np.allclose to
+    compare them after calling `normalize_signs` succeeds.
+
+    To do so, it distinguishes two cases for every column:
+
+    - It can be all almost equal to 0 (this includes a column of
+      zeros).
+    - Otherwise, it has a value that isn't close to 0.
+
+    In the first case, no sign needs to be flipped. I.e., for
+    |epsilon| small, np.allclose(-epsilon, 0) is true if and only if
+    np.allclose(epsilon, 0) is.
+
+    In the second case, the function finds the number in the column
+    whose absolute value is largest. Then, it compares its sign with
+    the number found in the same index, but in the other array, and
+    flips the sign of the column as needed.
+
+    """
+    # Let's convert everything to floating point numbers (it's
+    # reasonable to assume that eigenvectors will already be floating
+    # point numbers). This is necessary because np.array(1) /
+    # np.array(0) != np.array(1.) / np.array(0.)
+    arr1 = np.asarray(arr1, dtype=np.float64)
+    arr2 = np.asarray(arr2, dtype=np.float64)
+
+    if arr1.shape != arr2.shape:
+        raise ValueError(
+            "Arrays must have the same shape ({0} vs {1}).".format(
+                arr1.shape, arr2.shape
+            )
+        )
+
+    # To avoid issues around zero, we'll compare signs of the values
+    # with highest absolute value
+    max_idx = np.abs(arr1).argmax(axis=0)
+    max_arr1 = arr1[max_idx, range(arr1.shape[1])]
+    max_arr2 = arr2[max_idx, range(arr2.shape[1])]
+
+    sign_arr1 = np.sign(max_arr1)
+    sign_arr2 = np.sign(max_arr2)
+
+    # Store current warnings, and ignore division by zero (like 1. /
+    # 0.) and invalid operations (like 0. / 0.)
+    wrn = np.seterr(invalid="ignore", divide="ignore")
+    differences = sign_arr1 / sign_arr2
+    # The values in `differences` can be:
+    #    1 -> equal signs
+    #   -1 -> diff signs
+    #   Or nan (0/0), inf (nonzero/0), 0 (0/nonzero)
+    np.seterr(**wrn)
+
+    # Now let's deal with cases where `differences != \pm 1`
+    special_cases = (~np.isfinite(differences)) | (differences == 0)
+    # In any of these cases, the sign of the column doesn't matter, so
+    # let's just keep it
+    differences[special_cases] = 1
+
+    return arr1 * differences, arr2
+
+
+def assert_data_frame_almost_equal(left, right, rtol=1e-5):
+    """Raise AssertionError if ``pd.DataFrame`` objects are not "almost equal".
+
+    Wrapper of ``pd.util.testing.assert_frame_equal``. Floating point values
+    are considered "almost equal" if they are within a threshold defined by
+    ``assert_frame_equal``. This wrapper uses a number of
+    checks that are turned off by default in ``assert_frame_equal`` in order to
+    perform stricter comparisons (for example, ensuring the index and column
+    types are the same). It also does not consider empty ``pd.DataFrame``
+    objects equal if they have a different index.
+
+    Other notes:
+
+    * Index (row) and column ordering must be the same for objects to be equal.
+    * NaNs (``np.nan``) in the same locations are considered equal.
+
+    This is a helper function intended to be used in unit tests that need to
+    compare ``pd.DataFrame`` objects.
+
+    Parameters
+    ----------
+    left, right : pd.DataFrame
+        ``pd.DataFrame`` objects to compare.
+    rtol : float, optional
+        The relative tolerance parameter used for comparison. Defaults to 1e-5.
+
+    Raises
+    ------
+    AssertionError
+        If `left` and `right` are not "almost equal".
+
+    See Also
+    --------
+    pandas.util.testing.assert_frame_equal
+
+    """
+    # pass all kwargs to ensure this function has consistent behavior even if
+    # `assert_frame_equal`'s defaults change
+    pdt.assert_frame_equal(
+        left,
+        right,
+        check_dtype=True,
+        check_index_type=True,
+        check_column_type=True,
+        check_frame_type=True,
+        check_names=True,
+        by_blocks=False,
+        check_exact=False,
+        rtol=rtol,
+    )
+    # this check ensures that empty DataFrames with different indices do not
+    # compare equal. exact=True specifies that the type of the indices must be
+    # exactly the same
+    assert_index_equal(left.index, right.index)
+
+
+def _data_frame_to_default_int_type(df):
+    """Convert integer columns in a data frame into the platform-default integer type.
+
+    Pandas DataFrame defaults to int64 when reading integers, rather than respecting
+    the platform default (Linux and MacOS: int64, Windows: int32). This causes issues
+    in comparing observed and expected data frames in Windows. This function repairs
+    the issue by converting int64 columns of a data frame into int32 in Windows.
+
+    See: https://github.com/unionai-oss/pandera/issues/726
+
+    """
+    for col in df.select_dtypes("int").columns:
+        df[col] = df[col].astype(int)
+
+
+def assert_series_almost_equal(left, right):
+    # pass all kwargs to ensure this function has consistent behavior even if
+    # `assert_series_equal`'s defaults change
+    pdt.assert_series_equal(
+        left,
+        right,
+        check_dtype=True,
+        check_index_type=True,
+        check_series_type=True,
+        check_names=True,
+        check_exact=False,
+        obj="Series",
+    )
+    # this check ensures that empty Series with different indices do not
+    # compare equal.
+    assert_index_equal(left.index, right.index)
+
+
+def assert_index_equal(a, b):
+    pdt.assert_index_equal(a, b, exact=True, check_names=True, check_exact=True)
+
+
+def pytestrunner():
+    try:
+        import numpy
+
+        try:
+            # NumPy 1.14 changed repr output breaking our doctests,
+            # request the legacy 1.13 style
+            numpy.set_printoptions(legacy="1.13")
+        except TypeError:
+            # Old Numpy, output should be fine as it is :)
+            # TypeError: set_printoptions() got an unexpected
+            # keyword argument 'legacy'
+            pass
+    except ImportError:
+        numpy = None
+
+    try:
+        import pandas
+
+        # Max columns is automatically set by pandas based on terminal
+        # width, so set columns to unlimited to prevent the test suite
+        # from passing/failing based on terminal size.
+        pandas.options.display.max_columns = None
+    except ImportError:
+        pandas = None
+
+    try:
+        import matplotlib
+    except ImportError:
+        matplotlib = None
+    else:
+        # Set a non-interactive backend for Matplotlib, such that it can work on
+        # systems without graphics
+        matplotlib.use("agg")
+
+    # import here, cause outside the eggs aren't loaded
+    import pytest
+
+    errno = pytest.main(args=["--pyargs", "skbio"] + sys.argv[1:])
+    sys.exit(errno)
+
+
+# -------------------------------------------------------------------------------------
+# Array API test infrastructure
+#
+# Write one test method, run it against every supported array backend
+# (numpy, jax, torch, cupy). Uses ``unittest.subTest()`` for per-backend
+# reporting — no pytest required.
+#
+# Env vars:
+#   SKBIO_ARRAY_BACKEND  — "numpy" (default), "jax", "torch", "cupy", or "all"
+#   SKBIO_DEVICE         — "cpu" (default), "cuda", "gpu"
+#
+# Note: ``"gpu"`` (JAX's native string) and ``"cuda"`` (Torch/CuPy's native
+# string) refer to the same hardware and are treated as equivalent.
+#
+# Usage:
+#     class TestClosure(TestCase, ArrayAPITestMixin):
+#         @array_backends("numpy", "jax", "torch", "cupy")
+#         def test_basic(self, xp, device):
+#             data = self.make_array(xp, device, [[2.0, 2.0, 6.0]])
+#             result = closure(data)
+#             self.assert_type_preserved(result, xp, device)
+#             self.assert_close(result, self.make_array(xp, device, [[0.2, 0.2, 0.6]]))
+# -------------------------------------------------------------------------------------
+
+
+# Two device-name spellings that refer to the same hardware. Used only to
+# decide whether a requested ``SKBIO_DEVICE`` matches a backend's advertised
+# device — never to inspect a real array (see ``_on_device`` for that).
+_GPU_ALIASES = frozenset({"cuda", "gpu"})
+
+
+def _device_specs_match(a, b):
+    """True if two device-spec strings refer to the same hardware.
+
+    Both inputs are expected to be the per-backend strings stored in
+    ``_BACKENDS`` or read from ``SKBIO_DEVICE`` — short labels like ``"cpu"``,
+    ``"cuda"``, or ``"gpu"``. This is *not* for inspecting a real array's
+    device; use ``_on_device`` for that.
+    """
+    if a is None or b is None:
+        return a == b
+    a, b = a.lower(), b.lower()
+    if a == b:
+        return True
+    return a in _GPU_ALIASES and b in _GPU_ALIASES
+
+
+def _on_device(arr, xp, device):
+    """Return whether ``arr`` lives on ``device`` according to its backend.
+
+    Asks each backend a structured question rather than parsing the
+    ``__repr__`` of a device object, so it doesn't break when a backend
+    changes how it prints devices.
+
+    Parameters
+    ----------
+    arr : array
+        An array produced by ``xp``.
+    xp : module
+        The array namespace that produced ``arr`` (e.g. ``numpy``,
+        ``jax.numpy``, ``torch``, ``cupy``).
+    device : str or None
+        The expected device: ``"cpu"``, ``"cuda"``, ``"gpu"``, or ``None``
+        (treated as ``"cpu"``).
+
+    Returns
+    -------
+    bool
+
+    Raises
+    ------
+    NotImplementedError
+        If ``xp`` is not a recognized backend.
+    """
+    backend = _get_backend_name(xp)
+    want_gpu = device is not None and device.lower() in _GPU_ALIASES
+    want_cpu = device is None or device.lower() == "cpu"
+
+    if backend == "numpy":
+        # NumPy is CPU-only; "cuda"/"gpu" never matches.
+        return want_cpu
+
+    if backend == "cupy":
+        # CuPy arrays are always on CUDA.
+        return want_gpu
+
+    if backend == "torch":
+        # arr.device.type is "cpu" or "cuda" (or "mps", etc.)
+        kind = arr.device.type
+        if want_cpu:
+            return kind == "cpu"
+        if want_gpu:
+            return kind == "cuda"
+        return False
+
+    if backend == "jax":
+        # JAX device objects expose .platform: "cpu", "gpu", or "tpu".
+        platform = arr.device.platform
+        if want_cpu:
+            return platform == "cpu"
+        if want_gpu:
+            return platform == "gpu"
+        return False
+
+    raise NotImplementedError(f"_on_device: unknown backend {backend!r}")
+
+
+def _read_env():
+    """Read backend/device environment variables."""
+    backend = os.environ.get("SKBIO_ARRAY_BACKEND", "").strip()
+    device = os.environ.get("SKBIO_DEVICE", "").strip() or None
+    return backend, device
+
+
+def _get_array_backends():
+    """Return dict of {name: (namespace, [devices])} for installed backends.
+
+    The device strings stored here are each backend's *native* form — JAX uses
+    ``"gpu"``, Torch and CuPy use ``"cuda"`` — because they get passed back to
+    the backend (e.g. via ``_move_to_device``).
+    """
+    _backends = {"numpy": (np, ["cpu"])}
+
+    try:
+        import jax
+        import jax.numpy as jnp
+
+        jax.config.update("jax_enable_x64", True)
+        devices = ["cpu"]
+        try:
+            if jax.devices("gpu"):
+                devices.append("gpu")
+        except RuntimeError:
+            pass
+        _backends["jax"] = (jnp, devices)
+    except ImportError:
+        pass
+
+    try:
+        import torch
+
+        devices = ["cpu"]
+        if torch.cuda.is_available():
+            devices.append("cuda")
+        _backends["torch"] = (torch, devices)
+    except ImportError:
+        pass
+
+    try:
+        import cupy
+
+        _backends["cupy"] = (cupy, ["cuda"])
+    except ImportError:
+        pass
+
+    return _backends
+
+
+_BACKENDS = _get_array_backends()
+
+
+def _should_run(backend_name, device):
+    """Check whether a backend/device combo should execute."""
+    env_backend, env_device = _read_env()
+
+    if not env_backend:
+        return backend_name == "numpy" and device == "cpu"
+
+    if env_backend == "all":
+        if env_device and not _device_specs_match(env_device, device):
+            return False
+        return True
+
+    if env_backend != backend_name:
+        return False
+
+    if env_device and not _device_specs_match(env_device, device):
+        return False
+
+    return True
+
+
+def xp_assert_close(actual, desired, rtol=1e-7, atol=0):
+    """Assert two arrays are element-wise equal within a tolerance.
+
+    Converts both arrays to NumPy (handles GPU arrays), then delegates to
+    ``numpy.testing.assert_allclose``.
+
+    """
+    npt.assert_allclose(_to_numpy(actual), _to_numpy(desired), rtol=rtol, atol=atol)
+
+
+def xp_assert_equal(actual, desired):
+    """Assert two arrays are element-wise exactly equal.
+
+    Converts both arrays to NumPy (handles GPU arrays), then delegates to
+    ``numpy.testing.assert_array_equal``.
+
+    """
+    npt.assert_array_equal(_to_numpy(actual), _to_numpy(desired))
+
+
+def array_backends(*backend_names, cpu_only=False):
+    """Decorator: run a test method once per supported backend/device.
+
+    Uses ``unittest.subTest()`` for per-backend reporting.
+
+    Parameters
+    ----------
+    *backend_names : str
+        Backends to run on. Defaults to all if empty.
+    cpu_only : bool, optional
+        If True, skip GPU devices.
+
+    Raises
+    ------
+    RuntimeError
+        If ``SKBIO_ARRAY_BACKEND`` names a backend that is not installed.
+
+    """
+    if not backend_names:
+        backend_names = ("numpy", "jax", "torch", "cupy")
+
+    def decorator(test_func):
+        @functools.wraps(test_func)
+        def wrapper(self):
+            env_backend, env_device = _read_env()
+
+            # Hard error when a specific backend was requested but is missing.
+            if env_backend and env_backend != "all" and env_backend not in _BACKENDS:
+                raise RuntimeError(
+                    f"SKBIO_ARRAY_BACKEND={env_backend!r} but "
+                    f"{env_backend!r} is not installed. "
+                    f"Installed backends: {sorted(_BACKENDS.keys())}"
+                )
+
+            ran_any = False
+            for name in backend_names:
+                if name not in _BACKENDS:
+                    continue
+                xp, devices = _BACKENDS[name]
+                for device in devices:
+                    if cpu_only and device != "cpu":
+                        continue
+                    if not _should_run(name, device):
+                        continue
+
+                    ran_any = True
+                    with self.subTest(backend=name, device=device):
+                        test_func(self, xp, device)
+            if not ran_any:
+                if env_device:
+                    raise RuntimeError(
+                        f"SKBIO_DEVICE={env_device!r} was requested but no "
+                        f"backend has that device available."
+                    )
+                raise unittest.SkipTest(f"No matching backends for {backend_names}")
+
+        # Tag with a pytest marker so we can filter for CI with
+        # `pytest -m array_api`. Falls back silently if pytest not installed.
+        try:
+            import pytest
+
+            wrapper = pytest.mark.array_api(wrapper)
+        except ImportError:
+            pass
+
+        return wrapper
+
+    return decorator
+
+
+def numba_code(test_func):
+    """Decorator: mark a test as requiring optional Numba support."""
+    try:
+        import pytest
+
+        test_func = pytest.mark.numba(test_func)
+    except ImportError:
+        pass
+
+    try:
+        import numba  # noqa: F401
+    except ImportError:
+        test_func = unittest.skip("Numba is not installed.")(test_func)
+
+    return test_func
+
+
+class ArrayAPITestMixin:
+    """Mixin providing array-API test helpers for ``unittest.TestCase``.
+
+    Mix into your test class alongside ``TestCase``::
+
+        class TestMyFunc(unittest.TestCase, ArrayAPITestMixin):
+            ...
+
+    """
+
+    def make_array(self, xp, device, data, dtype=None):
+        """Create an array on the given backend and device."""
+        if dtype is None:
+            dtype = xp.float64
+        arr = xp.asarray(data, dtype=dtype)
+        return _move_to_device(arr, xp, device)
+
+    def assert_close(self, actual, expected, rtol=1e-7, atol=1e-7):
+        """Assert two arrays are numerically close (converts to numpy)."""
+        xp_assert_close(actual, expected, rtol=rtol, atol=atol)
+
+    def assert_type_preserved(self, result, xp, device):
+        """Assert result is from the correct backend and on the right device."""
+        import array_api_compat as aac
+
+        result_name = _get_backend_name(aac.array_namespace(result))
+        expected_name = _get_backend_name(xp)
+        self.assertEqual(
+            result_name,
+            expected_name,
+            f"Backend not preserved: result is {result_name}, expected {expected_name}",
+        )
+
+        # Skip the device check on CPU: not every backend exposes a useful
+        # device attribute for CPU arrays, and CPU/CPU is the trivial case.
+        if device in (None, "cpu"):
+            return
+
+        self.assertTrue(
+            _on_device(result, xp, device),
+            f"Device not preserved: result on "
+            f"{getattr(result, 'device', '<unknown>')}, expected {device}",
+        )

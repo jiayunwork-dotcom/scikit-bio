@@ -1,0 +1,5 @@
+check-manifest
+python-dateutil
+numpy
+ruff
+pre-commit

@@ -1,0 +1,1024 @@
+# ----------------------------------------------------------------------------
+# Copyright (c) 2013--, scikit-bio development team.
+#
+# Distributed under the terms of the Modified BSD License.
+#
+# The full license is in the file LICENSE.txt, distributed with this software.
+# ----------------------------------------------------------------------------
+
+from functools import partial
+from unittest import TestCase, main, skipIf
+import platform
+
+import numpy as np
+import numpy.testing as npt
+import pandas as pd
+from pandas.testing import assert_series_equal
+from scipy.spatial.distance import pdist, squareform
+from scipy.stats import f_oneway, ConstantInputWarning
+
+from skbio import DistanceMatrix
+from skbio.stats.ordination import pcoa, OrdinationResults
+from skbio.stats.distance import permdisp
+from skbio.stats.distance._permdisp import (
+    _compute_groups,
+    _try_permdisp_gpu,
+    NUMBA_AVAILABLE,
+)
+from skbio.stats.distance import _gpu as gpu_mod
+from skbio.stats.distance import _permdisp_gpu as permdisp_gpu
+from skbio.stats.distance._permdisp_gpu import (
+    _group_order,
+    _kernel_sizes,
+    _kernel_supports_shape,
+    _MAX_DIMS,
+)
+from skbio.stats.distance._cutils import geomedian_axis_one
+from skbio.util import get_data_path, numba_code
+from skbio.util._array import _get_backend_name
+from skbio.util._testing import ArrayAPITestMixin, array_backends
+
+IS_INTEL_MAC = platform.system() == "Darwin" and platform.machine() == "x86_64"
+
+class PERMDISPTests(TestCase):
+
+    def setUp(self):
+        # test with 2 groups of equal size
+        # when assigned different labels, results should be the same
+        self.grouping_eq = ['foo', 'foo', 'foo', 'bar', 'bar', 'bar']
+        self.grouping_eq_relab = ['pyt', 'pyt', 'pyt', 'hon', 'hon', 'hon']
+        self.exp_index = ['method name', 'test statistic name', 'sample size',
+                          'number of groups', 'test statistic', 'p-value',
+                          'number of permutations']
+        # test with 3 groups of different sizes
+        # when assigned different labels results should be the same
+        self.grouping_uneq = ['foo', 'foo', 'bar', 'bar', 'bar',
+                              'qw', 'qw', 'qw', 'qw']
+
+        self.grouping_uneq_relab = [12, 12, 7, 7, 7, 23, 23, 23, 23]
+
+        self.grouping_un_mixed = ['a', 'a', 7, 7, 7, 'b', 'b', 'b', 'b']
+
+        eq_ids = ['s1', 's2', 's3', 's4', 's5', 's6']
+        uneq_ids = ['s1', 's2', 's3', 's4', 's5', 's6', 's7', 's8', 's9']
+        # matrix for equal grouping
+        self.eq_mat = DistanceMatrix([[0, 4, 0, 0, 4, 2],
+                                      [4, 0, 2, 0, 3, 1],
+                                      [0, 2, 0, 5, 2, 5],
+                                      [0, 0, 5, 0, 0, 2],
+                                      [4, 3, 2, 0, 0, 2],
+                                      [2, 1, 5, 2, 2, 0]], eq_ids)
+
+        # matrix for unequal grouping
+        self.uneq_mat = DistanceMatrix([[0, 0, 4, 0, 0, 3, 5, 3, 0],
+                                        [0, 0, 0, 3, 4, 5, 3, 0, 3],
+                                        [4, 0, 0, 4, 3, 1, 0, 5, 2],
+                                        [0, 3, 4, 0, 0, 2, 1, 3, 5],
+                                        [0, 4, 3, 0, 0, 1, 1, 5, 0],
+                                        [3, 5, 1, 2, 1, 0, 2, 0, 5],
+                                        [5, 3, 0, 1, 1, 2, 0, 4, 3],
+                                        [3, 0, 5, 3, 5, 0, 4, 0, 4],
+                                        [0, 3, 2, 5, 0, 5, 3, 4, 0]], uneq_ids)
+
+        # null matrix for equal grouping
+        self.null_mat = DistanceMatrix([[0, 0, 0, 0, 0, 0],
+                                        [0, 0, 0, 0, 0, 0],
+                                        [0, 0, 0, 0, 0, 0],
+                                        [0, 0, 0, 0, 0, 0],
+                                        [0, 0, 0, 0, 0, 0],
+                                        [0, 0, 0, 0, 0, 0]], eq_ids)
+
+        unif_ids = ['PC.354', 'PC.355', 'PC.356', 'PC.481', 'PC.593', 'PC.607',
+                    'PC.634', 'PC.635', 'PC.636']
+
+        self.unifrac_dm = DistanceMatrix(
+            [[0.0, 0.595483768391, 0.618074717633, 0.582763100909,
+              0.566949022108, 0.714717232268, 0.772001731764, 0.690237118413,
+              0.740681707488],
+             [0.595483768391, 0.0, 0.581427669668, 0.613726772383,
+              0.65945132763, 0.745176523638, 0.733836123821, 0.720305073505,
+              0.680785600439],
+             [0.618074717633, 0.581427669668, 0.0, 0.672149021573,
+              0.699416863323, 0.71405573754, 0.759178215168, 0.689701276341,
+              0.725100672826],
+             [0.582763100909, 0.613726772383, 0.672149021573, 0.0,
+              0.64756120797, 0.666018240373, 0.66532968784, 0.650464714994,
+              0.632524644216],
+             [0.566949022108, 0.65945132763, 0.699416863323, 0.64756120797,
+              0.0, 0.703720200713, 0.748240937349, 0.73416971958,
+              0.727154987937],
+             [0.714717232268, 0.745176523638, 0.71405573754, 0.666018240373,
+              0.703720200713, 0.0, 0.707316869557, 0.636288883818,
+              0.699880573956],
+             [0.772001731764, 0.733836123821, 0.759178215168, 0.66532968784,
+              0.748240937349, 0.707316869557, 0.0, 0.565875193399,
+              0.560605525642],
+             [0.690237118413, 0.720305073505, 0.689701276341, 0.650464714994,
+              0.73416971958, 0.636288883818, 0.565875193399, 0.0,
+              0.575788039321],
+             [0.740681707488, 0.680785600439, 0.725100672826, 0.632524644216,
+              0.727154987937, 0.699880573956, 0.560605525642, 0.575788039321,
+              0.0]], unif_ids)
+        
+        # condensed form
+        self.unifrac_dm_condensed = DistanceMatrix(self.unifrac_dm)
+
+        self.unif_grouping = ['Control', 'Control', 'Control', 'Control',
+                              'Control', 'Fast', 'Fast', 'Fast', 'Fast']
+
+        self.assert_series_equal = partial(assert_series_equal,
+                                           check_index_type=True,
+                                           check_series_type=True)
+
+    def test_centroids_eq_groups(self):
+        exp = [[1.2886811963240687, 1.890538910062923, 1.490527658097728],
+               [2.17349240061718, 2.3192679626679946, 2.028338553903792]]
+        exp_stat, _ = f_oneway(*exp)
+
+        dm = pcoa(self.eq_mat, warn_neg_eigval=False)
+        dm = dm.samples
+
+        obs = _compute_groups(dm, 'centroid', self.grouping_eq)
+        self.assertAlmostEqual(obs, exp_stat, places=6)
+
+        obs_relab = _compute_groups(dm, 'centroid', self.grouping_eq_relab)
+        self.assertAlmostEqual(obs_relab, obs, places=6)
+
+    def test_centroids_uneq_groups(self):
+        """
+        the expected result here was calculated by hand
+        """
+        exp = [[2.5847022428144935, 2.285624595858895,
+                1.7022431146340287],
+               [1.724817266046108, 1.724817266046108],
+               [2.4333280644972795, 2.389000390879655,
+                2.8547180589306036, 3.218568759338847]]
+        exp_stat, _ = f_oneway(*exp)
+
+        dm = pcoa(self.uneq_mat, warn_neg_eigval=False)
+        dm = dm.samples
+
+        obs = _compute_groups(dm, 'centroid', self.grouping_uneq)
+        self.assertAlmostEqual(obs, exp_stat, places=6)
+
+        obs_relab = _compute_groups(dm, 'centroid', self.grouping_uneq_relab)
+        self.assertAlmostEqual(obs, obs_relab, places=6)
+
+    def test_centroids_mixedgroups(self):
+        exp = [[2.5847022428144935, 2.285624595858895,
+                1.7022431146340287],
+               [1.724817266046108, 1.724817266046108],
+               [2.4333280644972795, 2.389000390879655,
+                2.8547180589306036, 3.218568759338847]]
+        dm = pcoa(self.uneq_mat, warn_neg_eigval=False)
+        dm = dm.samples
+
+        exp_stat, _ = f_oneway(*exp)
+
+        obs_mixed = _compute_groups(dm, 'centroid', self.grouping_un_mixed)
+        self.assertAlmostEqual(exp_stat, obs_mixed, places=6)
+
+    def test_centroids_null(self):
+        dm = pcoa(self.null_mat)
+        dm = dm.samples
+
+        # TODO: SciPy 1.17+ changed the behavior of f_oneway so that a
+        # ConstantInputWarning may no longer be emitted for this case.
+        # Once the expected behavior is clarified, consider reintroducing
+        # an explicit warning assertion here.
+        obs_null = _compute_groups(dm, 'centroid', self.grouping_eq)
+        np.isnan(obs_null)
+
+    def test_centroid_normal(self):
+        exp = pd.Series(index=self.exp_index,
+                        data=['PERMDISP', 'F-value', 9, 2, 0.244501519876,
+                              0.53, 99],
+                        name='PERMDISP results')
+
+        grouping = ['Control', 'Control', 'Control', 'Control', 'Control',
+                    'Fast', 'Fast', 'Fast', 'Fast']
+
+        obs = permdisp(self.unifrac_dm, grouping, test='centroid',
+                       permutations=99, seed=42,
+                       dimensions=self.unifrac_dm.shape[0])
+
+        self.assert_series_equal(obs, exp)
+
+    def test_centroid_normal_condensed(self):
+        exp = pd.Series(index=self.exp_index,
+                        data=['PERMDISP', 'F-value', 9, 2, 0.244501519876,
+                              0.53, 99],
+                        name='PERMDISP results')
+
+        grouping = ['Control', 'Control', 'Control', 'Control', 'Control',
+                    'Fast', 'Fast', 'Fast', 'Fast']
+
+        obs = permdisp(self.unifrac_dm_condensed, grouping, test='centroid',
+                       permutations=99, seed=42,
+                       dimensions=self.unifrac_dm_condensed.shape[0])
+
+        self.assert_series_equal(obs, exp)
+
+    @skipIf(IS_INTEL_MAC, "See issue #2382.")
+    def test_median_normal(self):
+        exp = pd.Series(index=self.exp_index,
+                        data=['PERMDISP', 'F-value', 9, 2, 0.139475441876,
+                              0.51, 99],
+                        name='PERMDISP results')
+
+        obs = permdisp(self.unifrac_dm, self.unif_grouping, test='median',
+                       permutations=99, seed=42,
+                       dimensions=self.unifrac_dm.shape[0])
+
+        self.assert_series_equal(obs, exp)
+
+        po = pcoa(self.unifrac_dm)
+
+        obs2 = permdisp(po, self.unif_grouping, test='median',
+                        permutations=99, seed=42)
+
+        self.assert_series_equal(obs2, exp)
+
+    @skipIf(IS_INTEL_MAC, "See issue #2382.")
+    def test_median_normal_condensed(self):
+        exp = pd.Series(index=self.exp_index,
+                        data=['PERMDISP', 'F-value', 9, 2, 0.139475441876,
+                              0.51, 99],
+                        name='PERMDISP results')
+
+        obs = permdisp(self.unifrac_dm_condensed, self.unif_grouping, test='median',
+                       permutations=99, seed=42,
+                       dimensions=self.unifrac_dm_condensed.shape[0])
+
+        self.assert_series_equal(obs, exp)
+
+        po = pcoa(self.unifrac_dm_condensed)
+
+        obs2 = permdisp(po, self.unif_grouping, test='median',
+                        permutations=99, seed=42)
+
+        self.assert_series_equal(obs2, exp)
+
+    @skipIf(IS_INTEL_MAC, "See issue #2382.")
+    def test_median_fsvd(self):
+        exp = pd.Series(index=self.exp_index,
+                        data=['PERMDISP', 'F-value', 9, 2, 0.04078077215673714,
+                              0.79, 99],
+                        name='PERMDISP results')
+
+        obs = permdisp(self.unifrac_dm, self.unif_grouping, test='median',
+                       permutations=99,
+                       method='fsvd', dimensions=3, seed=42)
+
+        self.assert_series_equal(obs, exp)
+
+        po = pcoa(self.unifrac_dm, method='fsvd', dimensions=3)
+        obs = permdisp(po, self.unif_grouping, test='median',
+                       permutations=99, seed=42)
+
+        self.assert_series_equal(obs, exp)
+
+    @skipIf(IS_INTEL_MAC, "See issue #2382.")
+    def test_median_fsvd_condensed(self):
+        exp = pd.Series(index=self.exp_index,
+                        data=['PERMDISP', 'F-value', 9, 2, 0.04078077215673714,
+                              0.79, 99],
+                        name='PERMDISP results')
+
+        obs = permdisp(self.unifrac_dm_condensed, self.unif_grouping, test='median',
+                       permutations=99,
+                       method='fsvd', dimensions=3, seed=42)
+
+        self.assert_series_equal(obs, exp)
+
+        po = pcoa(self.unifrac_dm_condensed, method='fsvd', dimensions=3)
+        obs = permdisp(po, self.unif_grouping, test='median',
+                       permutations=99, seed=42)
+
+        self.assert_series_equal(obs, exp)
+
+    def test_fsvd_seed_is_reproducible(self):
+        # fsvd draws a random projection, so permdisp has to pass its seed down
+        # to pcoa for the result to be reproducible. The matrix has to be large
+        # enough that different projections actually disagree; on a handful of
+        # samples they all converge and the difference is invisible. No
+        # permutations are needed, since the statistic alone depends on the
+        # ordination.
+        rng = np.random.default_rng(0)
+        mat = rng.random((60, 60))
+        mat = (mat + mat.T) / 2
+        np.fill_diagonal(mat, 0.0)
+        dm = DistanceMatrix(mat)
+        grouping = ['a'] * 30 + ['b'] * 30
+
+        for test in ('centroid', 'median'):
+            first = permdisp(dm, grouping, test=test, permutations=0,
+                             method='fsvd', seed=42)
+            repeat = permdisp(dm, grouping, test=test, permutations=0,
+                              method='fsvd', seed=42)
+            npt.assert_allclose(repeat['test statistic'],
+                                first['test statistic'])
+
+    def test_not_distance_matrix(self):
+        dm = []
+        grouping = ['Control', 'Control', 'Control', 'Control', 'Control',
+                    'Fast', 'Fast', 'Fast', 'Fast']
+
+        npt.assert_raises(TypeError, permdisp, dm, grouping, permutations=0)
+
+    def test_mismatched_group(self):
+
+        gr = ['foo', 'bar']
+        npt.assert_raises(ValueError, permdisp, self.unifrac_dm, gr)
+
+    def test_single_group(self):
+
+        gr = ['f', 'f', 'f', 'f', 'f', 'f', 'f', 'f', 'f']
+        npt.assert_raises(ValueError, permdisp, self.unifrac_dm, gr)
+
+    def test_no_permuations(self):
+        obs = permdisp(self.eq_mat, self.grouping_eq, permutations=0,
+                       dimensions=self.eq_mat.shape[0],
+                       warn_neg_eigval=False)
+
+        pval = obs['p-value']
+        np.isnan(pval)
+
+    def test_geomedian(self):
+        exp = np.array([2.01956244, 1.53164546, 2.60571752, 0.91424179,
+                        1.76214416, 1.69943057])
+        obs = np.array(geomedian_axis_one(self.eq_mat.data))
+        npt.assert_almost_equal(obs, exp, decimal=6)
+
+    def test_geomedian_all_points_coincide(self):
+        # Every point sitting on the same spot leaves the iteration with no
+        # direction to move in, and that spot is the median. The weight total
+        # is zero there, so the division that normalizes the weights has to be
+        # skipped rather than reached.
+        for p, n in ((2, 6), (3, 4), (10, 2), (1, 3)):
+            point = np.arange(1., p + 1.) * 1.5
+            X = np.ascontiguousarray(np.tile(point[:, None], (1, n)))
+            npt.assert_allclose(np.asarray(geomedian_axis_one(X)), point)
+
+    def test_geomedian_all_points_coincide_float32(self):
+        # The fused kernel has a separate single precision specialization, so
+        # the zero weight total has to be handled on that branch too.
+        point = np.array([1.5, -2.0], dtype=np.float32)
+        X = np.ascontiguousarray(np.tile(point[:, None], (1, 5)))
+        npt.assert_allclose(np.asarray(geomedian_axis_one(X)), point)
+
+    def test_median_identical_samples_within_group(self):
+        # Technical replicates put every sample of a group on one ordination
+        # point, which is what drives the group's geometric median onto that
+        # point. This used to raise from inside geomedian_axis_one.
+        dm = DistanceMatrix(
+            [[0., 0., 0., 1., 1., 1.],
+             [0., 0., 0., 1., 1., 1.],
+             [0., 0., 0., 1., 1., 1.],
+             [1., 1., 1., 0., 0., 0.],
+             [1., 1., 1., 0., 0., 0.],
+             [1., 1., 1., 0., 0., 0.]],
+            ['s1', 's2', 's3', 's4', 's5', 's6'])
+        grouping = ['a', 'a', 'a', 'b', 'b', 'b']
+
+        obs = permdisp(dm, grouping, test='median', permutations=99, seed=42,
+                       dimensions=3)
+        self.assertEqual(obs['method name'], 'PERMDISP')
+        self.assertEqual(obs['sample size'], 6)
+        self.assertEqual(obs['number of groups'], 2)
+        self.assertTrue(np.isfinite(obs['test statistic']))
+
+    def test_confirm_betadispr_results(self):
+        mp_dm = DistanceMatrix.read(get_data_path('moving_pictures_dm.tsv'))
+        mp_mf = pd.read_csv(get_data_path('moving_pictures_mf.tsv'), sep='\t')
+        mp_mf.set_index('#SampleID', inplace=True)
+
+        obs_med_mp = permdisp(mp_dm, mp_mf, column='BodySite', seed=42,
+                              dimensions=mp_dm.shape[0])
+        obs_cen_mp = permdisp(mp_dm, mp_mf, column='BodySite', test='centroid',
+                              seed=42, dimensions=mp_dm.shape[0])
+
+        exp_data_m = ['PERMDISP', 'F-value', 33, 4, 10.1956, 0.001, 999]
+        exp_data_c = ['PERMDISP', 'F-value', 33, 4, 17.4242, 0.001, 999]
+        exp_ind = ['method name', 'test statistic name', 'sample size',
+                   'number of groups', 'test statistic', 'p-value',
+                   'number of permutations']
+
+        exp_med_mp = pd.Series(data=exp_data_m, index=exp_ind, dtype='object',
+                               name='PERMDISP results')
+
+        exp_cen_mp = pd.Series(data=exp_data_c, index=exp_ind, dtype='object',
+                               name='PERMDISP results')
+
+        self.assert_series_equal(exp_med_mp, obs_med_mp)
+
+        self.assert_series_equal(exp_cen_mp, obs_cen_mp)
+
+    def test_call_via_series(self):
+        # test https://github.com/scikit-bio/scikit-bio/issues/1877
+        # actual issue is with _base._preprocess_input_sng but permdisp is
+        # indirectly affected
+        dm = DistanceMatrix.read(get_data_path('frameSeries_dm.tsv'))
+        grouping = pd.read_csv(get_data_path("frameSeries_grouping.tsv"),
+                               sep="\t", index_col=0)
+
+        obs_frame = permdisp(dm, grouping, column='tumor', seed=42,
+                             warn_neg_eigval=False)
+
+        obs_series = permdisp(dm, grouping['tumor'], seed=42, warn_neg_eigval=False)
+
+        # in principle, both tests - if seed is the same - should return the
+        # exact same results. However, they don't for the current example ...
+        self.assert_series_equal(obs_frame, obs_series)
+
+    def test_invalid_test(self):
+        with self.assertRaises(ValueError) as cm:
+            permdisp(self.unifrac_dm, [], test='invalid')
+        self.assertEqual(str(cm.exception), "Test must be centroid or median.")
+
+    def test_invalid_method(self):
+        with self.assertRaises(ValueError) as cm:
+            permdisp(self.unifrac_dm, [], method='invalid')
+        self.assertEqual(str(cm.exception), "Method must be eigh or fsvd.")
+
+    def test_no_mutation_of_ordination_results(self):
+        po = pcoa(self.unifrac_dm, warn_neg_eigval=False)
+        original_columns = po.samples.columns.tolist()
+        
+        permdisp(po, self.unif_grouping, permutations=0, warn_neg_eigval=False)
+        
+        self.assertEqual(po.samples.columns.tolist(), original_columns)
+        self.assertNotIn("grouping", po.samples.columns.tolist())
+
+    def test_permdisp_passes_dimensions_through(self):
+        # Regression test for issue #2430. Previously `permdisp` silently
+        # overrode `dimensions = 0` before calling pcoa, which tripped
+        # pcoa's "EIGH: since no value for dimensions..." warning on every
+        # call for distance matrices larger than 10 samples. `permdisp`
+        # now passes `dimensions` through unchanged: normal usage (an
+        # explicit positive value, or the default of 10) no longer leaks
+        # the warning, while users who explicitly opt in with
+        # `dimensions=0` still receive it (per #2456 review).
+        import warnings
+        from scipy.spatial.distance import pdist, squareform
+
+        rng = np.random.default_rng(0)
+        n = 12  # exceed pcoa's 10-sample warning threshold
+        coords = rng.random((n, 5))
+        big_dm = DistanceMatrix(
+            squareform(pdist(coords)),
+            ids=[f"s{i}" for i in range(n)],
+        )
+        grouping = ["A"] * 6 + ["B"] * 6
+
+        # Case 1: default permdisp call (dimensions=10) — no warning.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            permdisp(big_dm, grouping, permutations=9, warn_neg_eigval=False)
+        self.assertFalse(
+            any("EIGH" in str(w.message) for w in caught),
+            "permdisp with a positive dimensions value must not emit "
+            "pcoa's 'EIGH: since no value for dimensions...' warning",
+        )
+
+        # Case 2: user explicitly passes dimensions=0 — warning preserved.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            permdisp(big_dm, grouping, permutations=9,
+                     dimensions=0, warn_neg_eigval=False)
+        self.assertTrue(
+            any(issubclass(w.category, RuntimeWarning)
+                and "EIGH" in str(w.message) for w in caught),
+            "permdisp must surface pcoa's EIGH warning when the caller "
+            "explicitly passes dimensions=0 on a large matrix",
+        )
+
+
+class PERMDISPEngineTests(TestCase):
+    """The numba engine must agree with cython, statistic and p-value alike."""
+
+    def setUp(self):
+        # A few well separated groups over a random matrix, large enough that
+        # the pcoa retains the default ten dimensions.
+        rng = np.random.default_rng(0)
+        mat = rng.random((30, 30))
+        mat = (mat + mat.T) / 2
+        np.fill_diagonal(mat, 0.0)
+        self.dm = DistanceMatrix(mat)
+        self.grouping = ['a'] * 10 + ['b'] * 10 + ['c'] * 10
+
+    def _assert_engines_agree(self, test, **kwargs):
+        obs = permdisp(self.dm, self.grouping, test=test, seed=42,
+                       engine="numba", **kwargs)
+        exp = permdisp(self.dm, self.grouping, test=test, seed=42,
+                       engine="cython", **kwargs)
+        npt.assert_allclose(obs['test statistic'], exp['test statistic'])
+        # The p-value is the real check: it only matches if the numba driver
+        # draws permutations in the same order as the cython path.
+        self.assertEqual(obs['p-value'], exp['p-value'])
+
+    @numba_code
+    def test_centroid_matches_cython(self):
+        self._assert_engines_agree("centroid", permutations=99)
+
+    @numba_code
+    def test_median_matches_cython(self):
+        self._assert_engines_agree("median", permutations=99)
+
+    @numba_code
+    def test_p_value_matches_cython_across_seeds(self):
+        # The p-value only matches if the numba driver consumes the random
+        # stream exactly as the cython path does. A desynchronized stream
+        # still agrees on most seeds, so one seed is not enough to catch it.
+        for seed in range(10):
+            obs = permdisp(self.dm, self.grouping, test="median",
+                           permutations=99, seed=seed, engine="numba")
+            exp = permdisp(self.dm, self.grouping, test="median",
+                           permutations=99, seed=seed, engine="cython")
+            self.assertEqual(obs['p-value'], exp['p-value'])
+
+    @numba_code
+    def test_uneven_groups_match_cython(self):
+        self.grouping = ['a'] * 4 + ['b'] * 6 + ['c'] * 20
+        self._assert_engines_agree("median", permutations=99)
+
+    @numba_code
+    def test_dimensions_passed_through(self):
+        self._assert_engines_agree("median", permutations=99, dimensions=3)
+
+    @numba_code
+    def test_ordination_input_matches_cython(self):
+        # permdisp also accepts an OrdinationResults directly, which skips the
+        # internal pcoa call. The engine dispatch happens after that branch, so
+        # both input forms have to agree.
+        ordination = pcoa(self.dm, method="eigh", dimensions=10)
+        for test in ("centroid", "median"):
+            obs = permdisp(ordination, self.grouping, test=test,
+                           permutations=99, seed=42, engine="numba")
+            exp = permdisp(ordination, self.grouping, test=test,
+                           permutations=99, seed=42, engine="cython")
+            npt.assert_allclose(obs['test statistic'], exp['test statistic'])
+            self.assertEqual(obs['p-value'], exp['p-value'])
+
+    @numba_code
+    def test_no_permutations(self):
+        # permutations=0 skips the batch entirely and returns a NaN p-value.
+        obs = permdisp(self.dm, self.grouping, permutations=0, engine="numba")
+        exp = permdisp(self.dm, self.grouping, permutations=0, engine="cython")
+        npt.assert_allclose(obs['test statistic'], exp['test statistic'])
+        self.assertTrue(np.isnan(obs['p-value']))
+
+    @numba_code
+    def test_geomedian_matches_cython_kernel(self):
+        # The numba geomedian is a port of geomedian_axis_one and has to
+        # return the same center, including for the degenerate single-column
+        # case that returns the mean without iterating.
+        from skbio.stats.distance._permdisp import _geomedian_nb
+
+        rng = np.random.default_rng(1)
+        for shape in [(10, 30), (3, 50), (10, 1), (10, 2)]:
+            X = np.ascontiguousarray(rng.random(shape))
+            npt.assert_allclose(_geomedian_nb(X.copy()),
+                                np.asarray(geomedian_axis_one(X.copy())))
+
+        # Layouts where the iteration lands exactly on one of the samples.
+        # That is the one path needing the zero-distance correction, and these
+        # particular ones move to a different center without it, so they pin
+        # the correction down rather than merely reaching it.
+        degenerate = [np.array([[2.0, 1.0, -2.0, 2.0, -3.0, 0.0]]),
+                      np.array([[0.0, 3.0, -2.0, -1.0, 2.0, -2.0]]),
+                      np.array([[-2.0, -1.0, -1.0, 0.0, -1.0, 1.0]]),
+                      np.array([[-1.0, 1.0, 0.0, 0.0, 0.0],
+                                [0.0, 0.0, -1.0, 1.0, 0.0]])]
+        for X in degenerate:
+            X = np.ascontiguousarray(X)
+            npt.assert_allclose(_geomedian_nb(X.copy()),
+                                np.asarray(geomedian_axis_one(X.copy())))
+
+    @numba_code
+    def test_geomedian_all_points_coincide(self):
+        # Every sample sitting on the same spot leaves the iteration with no
+        # direction to move in, and the median is that spot. Not compared
+        # against geomedian_axis_one here because the Cython kernel divides by
+        # a zero weight total before reaching that test and raises instead.
+        from skbio.stats.distance._permdisp import _geomedian_nb
+
+        X = np.ascontiguousarray(np.tile(np.array([[1.5], [-2.0]]), (1, 6)))
+        npt.assert_allclose(_geomedian_nb(X), np.array([1.5, -2.0]))
+
+    @numba_code
+    def test_degenerate_anova_matches_f_oneway(self):
+        # The numba kernels inline the one-way ANOVA instead of calling
+        # scipy.stats.f_oneway, so the two have to agree where the ratio stops
+        # being finite. Putting each group on a shell of constant radius about
+        # its own center makes every within-group distance identical, which
+        # zeroes the within-group term: differing radii then leave the groups
+        # apart and give inf, equal radii give nan.
+        from skbio.stats.distance._permdisp import _permdisp_f_stat_centroid_nb
+
+        def shell(cx, cy, r, k):
+            th = np.linspace(0, 2 * np.pi, k, endpoint=False)
+            return np.stack([cx + r * np.cos(th), cy + r * np.sin(th)], axis=1)
+
+        codes = np.array([0] * 4 + [1] * 4)
+        for radius in (2.0, 1.0):
+            samples = np.vstack([shell(0.0, 0.0, 1.0, 4),
+                                 shell(10.0, 10.0, radius, 4)])
+            exp = _compute_groups(samples, "centroid", codes)
+            obs = _permdisp_f_stat_centroid_nb(
+                np.ascontiguousarray(samples),
+                np.ascontiguousarray(codes, dtype=np.int32), 2)
+            npt.assert_array_equal(obs, exp)
+
+    @numba_code
+    def test_tied_statistics_match_cython(self):
+        # With few samples per group many permutations reproduce the observed
+        # partition under a different labeling, which gives a statistic that
+        # is exactly equal to the observed one rather than merely close. Those
+        # ties count towards the p-value, so this pins the comparison down to
+        # the same ">=" the cython path uses. Only the centroid test is checked
+        # this way. _compute_groups builds its group list in np.unique label
+        # order and hands it to scipy.stats.f_oneway, which is not invariant to
+        # the order of its arguments; on the median distances that costs a last
+        # bit, so a relabeled partition does not always reproduce the statistic
+        # and the tie counts legitimately differ between the engines.
+        rng = np.random.default_rng(0)
+        mat = rng.random((6, 6))
+        mat = (mat + mat.T) / 2
+        np.fill_diagonal(mat, 0.0)
+        dm = DistanceMatrix(mat)
+        grouping = ['a'] * 3 + ['b'] * 3
+        obs = permdisp(dm, grouping, test="centroid", permutations=999, seed=42,
+                       engine="numba", dimensions=5, warn_neg_eigval=False)
+        exp = permdisp(dm, grouping, test="centroid", permutations=999, seed=42,
+                       engine="cython", dimensions=5, warn_neg_eigval=False)
+        npt.assert_allclose(obs['test statistic'], exp['test statistic'])
+        self.assertEqual(obs['p-value'], exp['p-value'])
+
+    @numba_code
+    def test_negative_permutations_raises(self):
+        with self.assertRaisesRegex(ValueError, "greater than or equal to zero"):
+            permdisp(self.dm, self.grouping, permutations=-1, engine="numba")
+
+    @numba_code
+    def test_crosses_chunk_boundary(self):
+        # The driver batches the permutations, so more than one chunk's worth
+        # exercises the multi-batch path. The RNG has to stay in step across
+        # chunks for the p-value to still match the cython engine.
+        from numba import get_num_threads
+        from skbio.stats.distance._permdisp import _PERM_CHUNK_PER_THREAD
+
+        permutations = _PERM_CHUNK_PER_THREAD * get_num_threads() + 5
+        obs = permdisp(self.dm, self.grouping, permutations=permutations,
+                       seed=42, engine="numba")
+        exp = permdisp(self.dm, self.grouping, permutations=permutations,
+                       seed=42, engine="cython")
+        npt.assert_allclose(obs['test statistic'], exp['test statistic'])
+        self.assertEqual(obs['p-value'], exp['p-value'])
+
+    @numba_code
+    def test_coincident_samples_agree_across_engines(self):
+        # The numba geomedian already returned the coincident point here while
+        # the cython kernel raised, so this input is where the two engines
+        # disagreed most starkly. With the cython kernel fixed they have to
+        # agree.
+        dm = DistanceMatrix(
+            [[0., 0., 0., 1., 1., 1.],
+             [0., 0., 0., 1., 1., 1.],
+             [0., 0., 0., 1., 1., 1.],
+             [1., 1., 1., 0., 0., 0.],
+             [1., 1., 1., 0., 0., 0.],
+             [1., 1., 1., 0., 0., 0.]],
+            ['s1', 's2', 's3', 's4', 's5', 's6'])
+        grouping = ['a', 'a', 'a', 'b', 'b', 'b']
+
+        obs = [permdisp(dm, grouping, test='median', permutations=99, seed=42,
+                        dimensions=3, engine=engine)
+               for engine in ('cython', 'numba')]
+        self.assertTrue(np.isfinite(obs[0]['test statistic']))
+        npt.assert_allclose(obs[0]['test statistic'],
+                            obs[1]['test statistic'], rtol=1e-12)
+        self.assertEqual(obs[0]['p-value'], obs[1]['p-value'])
+
+    @numba_code
+    def test_engine_fast_is_accepted(self):
+        # Checks that "fast" is plumbed through and gives the same answer, not
+        # which engine ran; the kernels reduce in parallel, so a cython-versus-
+        # numba comparison is not stable inside a full test session. Which
+        # engine "fast" resolves to is covered in skbio/tests/test_config.py.
+        obs = permdisp(self.dm, self.grouping, permutations=99, seed=42,
+                       engine="fast")
+        exp = permdisp(self.dm, self.grouping, permutations=99, seed=42,
+                       engine="numba")
+        self.assertAlmostEqual(obs['test statistic'], exp['test statistic'])
+        self.assertEqual(obs['p-value'], exp['p-value'])
+
+    @skipIf(NUMBA_AVAILABLE, "covers the branch taken when numba is absent")
+    def test_engine_fast_is_cython_without_numba(self):
+        # The counterpart to test_engine_fast_is_accepted above. Without numba
+        # installed, "fast" resolves to "cython" and runs the exact same
+        # cython call as engine="cython". Reuse the ordination so separate
+        # eigendecompositions cannot introduce floating-point differences.
+        ordination = pcoa(self.dm, dimensions=10)
+        obs = permdisp(ordination, self.grouping, permutations=99, seed=42,
+                       engine="fast")
+        exp = permdisp(ordination, self.grouping, permutations=99, seed=42,
+                       engine="cython")
+        self.assertEqual(obs['test statistic'], exp['test statistic'])
+        self.assertEqual(obs['p-value'], exp['p-value'])
+
+    @numba_code
+    def test_non_float_ordination_raises_like_cython(self):
+        # geomedian_axis_one only has single and double precision signatures,
+        # so the cython median path raises on anything else. The numba kernels
+        # would happily widen an integer array and return a number instead,
+        # which is worse than the error, so the engine refuses the same inputs.
+        # The centroid test never reaches that kernel and cython computes it
+        # for any numeric dtype, so both engines have to accept those.
+        ordination = pcoa(self.dm, method="eigh", dimensions=10)
+
+        def recast(dtype):
+            return OrdinationResults(
+                short_method_name=ordination.short_method_name,
+                long_method_name=ordination.long_method_name,
+                eigvals=ordination.eigvals,
+                samples=ordination.samples.astype(dtype),
+                proportion_explained=ordination.proportion_explained)
+
+        for dtype in ("float16", "int64"):
+            for engine in ("cython", "numba"):
+                with self.assertRaises(TypeError):
+                    permdisp(recast(dtype), self.grouping, test="median",
+                             permutations=0, engine=engine)
+        # single and double precision stay accepted by both
+        for dtype in ("float32", "float64"):
+            for engine in ("cython", "numba"):
+                permdisp(recast(dtype), self.grouping, test="median",
+                         permutations=0, engine=engine)
+        # the centroid test does not use geomedian_axis_one, so an integer
+        # ordination is computed rather than refused, and the two engines
+        # agree because numpy's mean promotes integers to float64. The pcoa
+        # coordinates are all smaller than one, so they have to be scaled
+        # before casting or every one of them truncates to zero and the
+        # comparison below is between two NaNs.
+        scaled = ordination.samples * 1000
+        for dtype in ("int64", "int32"):
+            as_int = OrdinationResults(
+                short_method_name=ordination.short_method_name,
+                long_method_name=ordination.long_method_name,
+                eigvals=ordination.eigvals,
+                samples=scaled.astype(dtype),
+                proportion_explained=ordination.proportion_explained)
+            obs = [permdisp(as_int, self.grouping, test="centroid",
+                            permutations=99, seed=42, engine=engine)
+                   for engine in ("cython", "numba")]
+            self.assertTrue(np.isfinite(obs[0]["test statistic"]))
+            npt.assert_allclose(obs[0]["test statistic"],
+                                obs[1]["test statistic"], rtol=1e-12)
+            # no permuted statistic lands within 1e-4 of the observed one on
+            # this fixture, so the ">=" counts cannot differ over a last-bit
+            # disagreement and the p-values are exactly equal.
+            self.assertEqual(obs[0]["p-value"], obs[1]["p-value"])
+        # a dtype numpy cannot do arithmetic on is refused by both engines
+        # rather than being quietly coerced by the numba path. Strings reach
+        # this as object too, since that is how pandas stores them.
+        for engine in ("cython", "numba"):
+            with self.assertRaises(TypeError):
+                permdisp(recast("object"), self.grouping, test="centroid",
+                         permutations=0, engine=engine)
+
+    @numba_code
+    def test_result_types_match_cython(self):
+        # permdisp returns an object-dtype Series, so the type of each entry is
+        # visible to the caller and must not depend on the engine.
+        for permutations in (0, 99):
+            obs = permdisp(self.dm, self.grouping, permutations=permutations,
+                           seed=42, engine="numba")
+            exp = permdisp(self.dm, self.grouping, permutations=permutations,
+                           seed=42, engine="cython")
+            for key in ("test statistic", "p-value"):
+                self.assertIs(type(obs[key]), type(exp[key]))
+
+    def test_bad_engine_raises(self):
+        with self.assertRaisesRegex(ValueError, "engine='julia' is not supported"):
+            permdisp(self.dm, self.grouping, permutations=0, engine="julia")
+
+
+class PermdispArrayAPITests(TestCase, ArrayAPITestMixin):
+    """permdisp on a DistanceMatrix backed by a non-NumPy array-API buffer."""
+
+    def setUp(self):
+        # Distances between real points, not a random symmetric matrix: pcoa on
+        # a non-Euclidean matrix warns about large negative eigenvalues, and
+        # this file should not add that noise to the suite.
+        rng = np.random.default_rng(1)
+        points = rng.random((12, 11))
+        a = squareform(pdist(points))
+        self.data = a
+        self.grouping = ['a', 'a', 'a', 'b', 'b', 'b',
+                         'c', 'c', 'c', 'd', 'd', 'd']
+        # The reference comes from a separate pcoa on a NumPy matrix, so these
+        # comparisons cross two eigendecompositions and two array backends.
+        # Reusing one ordination is not an option, because the GPU dispatch only
+        # engages for a DistanceMatrix. The tolerances below are set for that.
+        self.ref = {
+            test: permdisp(
+                DistanceMatrix(a), self.grouping, test=test,
+                permutations=99, seed=0,
+            )
+            for test in ("centroid", "median")
+        }
+
+    @array_backends("numpy", "jax", "torch", "cupy")
+    def test_permdisp_backends(self, xp, device):
+        # Without engine="numba" this is the cython path, which must keep
+        # working on a device-resident matrix: pcoa brings the coordinates to
+        # the host and the statistic is computed there as before.
+        dm = DistanceMatrix(self.make_array(xp, device, self.data))
+        for test in ("centroid", "median"):
+            with self.subTest(test=test):
+                res = permdisp(dm, self.grouping, test=test,
+                               permutations=99, seed=0)
+                ref = self.ref[test]
+                self.assertAlmostEqual(
+                    res['test statistic'], ref['test statistic'], places=7
+                )
+                self.assertAlmostEqual(res['p-value'], ref['p-value'], places=7)
+
+    @numba_code
+    @array_backends("numpy", "jax", "torch", "cupy")
+    def test_permdisp_numba_engine_backends(self, xp, device):
+        # engine="numba" on a device-resident matrix is what routes to the
+        # fused GPU kernel; on NumPy it exercises the CPU numba engine. Skipped
+        # automatically where Numba or the device is unavailable. This asserts
+        # the answer, not which path produced it: the two agree by design, so
+        # it cannot tell them apart and is not meant to.
+        dm = DistanceMatrix(self.make_array(xp, device, self.data))
+        for test in ("centroid", "median"):
+            with self.subTest(test=test):
+                res = permdisp(dm, self.grouping, test=test, permutations=99,
+                               seed=0, engine="numba")
+                ref = self.ref[test]
+                # Default tolerance, as in the other engine="numba" tests: the
+                # fused kernel sums in a different order than Cython, so the
+                # statistic is not expected to agree bit for bit.
+                self.assertAlmostEqual(
+                    res['test statistic'], ref['test statistic']
+                )
+                self.assertAlmostEqual(res['p-value'], ref['p-value'])
+
+
+class PermdispGpuKernelTests(TestCase, ArrayAPITestMixin):
+    """Whether the fused kernel is reached, asked of the kernel cache."""
+
+    def setUp(self):
+        rng = np.random.default_rng(1)
+        points = rng.random((12, 11))
+        self.data = squareform(pdist(points))
+        self.grouping = ['a', 'a', 'a', 'b', 'b', 'b',
+                         'c', 'c', 'c', 'd', 'd', 'd']
+
+    def _run(self, dm, test="centroid"):
+        cache = permdisp_gpu._kernels
+        cache.clear()
+        permdisp(dm, self.grouping, test=test, permutations=9, seed=0,
+                 engine="numba")
+        return cache
+
+    @numba_code
+    def test_numpy_input_never_reaches_kernel(self):
+        # A host matrix must stay on the host. Both the residency gate and
+        # _numba_gpu_module_for's own decline for the "numpy" backend enforce
+        # that, so this asserts the outcome, not which one produced it.
+        self.assertEqual(self._run(DistanceMatrix(self.data)), {})
+
+    @numba_code
+    @array_backends("jax", "torch", "cupy")
+    def test_gpu_kernel_is_used_on_device_input(self, xp, device):
+        # Result values cannot tell the GPU and host paths apart, so this asks
+        # the kernel cache, which only a dispatch to the kernel populates, and
+        # checks the backend was not marked unavailable, as a kernel that fails
+        # to compile or launch would be. JAX has no Numba GPU path and is
+        # skipped; it is listed because the harness errors on a GPU lane that
+        # runs no backend.
+        if device == "cpu" or _get_backend_name(xp) == "jax":
+            self.skipTest("needs a device-resident CuPy or PyTorch matrix")
+        dm = DistanceMatrix(self.make_array(xp, device, self.data))
+        for test in ("centroid", "median"):
+            with self.subTest(test=test):
+                self.assertTrue(self._run(dm, test),
+                                "dispatch never reached the GPU kernel")
+                self.assertNotIn(_get_backend_name(xp), gpu_mod._unavailable)
+
+    @numba_code
+    @array_backends("jax", "torch", "cupy")
+    def test_median_kernel_two_tiles(self, xp, device):
+        # 80 retained dimensions need two of the median kernel's 64-wide tiles.
+        if device == "cpu" or _get_backend_name(xp) == "jax":
+            self.skipTest("needs a device-resident CuPy or PyTorch matrix")
+        rng = np.random.default_rng(2)
+        data = squareform(pdist(rng.random((100, 90))))
+        grouping = [str(i % 4) for i in range(100)]
+        ref = permdisp(DistanceMatrix(data), grouping, test="median",
+                       permutations=99, dimensions=80, seed=0, engine="numba")
+        permdisp_gpu._kernels.clear()
+        res = permdisp(DistanceMatrix(self.make_array(xp, device, data)),
+                       grouping, test="median", permutations=99,
+                       dimensions=80, seed=0, engine="numba")
+        self.assertTrue(permdisp_gpu._kernels)
+        self.assertNotIn(_get_backend_name(xp), gpu_mod._unavailable)
+        self.assertAlmostEqual(res["test statistic"], ref["test statistic"],
+                               places=7)
+        self.assertAlmostEqual(res["p-value"], ref["p-value"], places=7)
+
+    @numba_code
+    @array_backends("jax", "torch", "cupy")
+    def test_many_groups_and_dims(self, xp, device):
+        # 70 groups and 100 dimensions, both past the old limits of 64. Three
+        # samples per group: with two, both lie at the same distance from their
+        # centroid, so the within-group spread is rounding noise and F is not
+        # stable enough to compare across engines.
+        if device == "cpu" or _get_backend_name(xp) == "jax":
+            self.skipTest("needs a device-resident CuPy or PyTorch matrix")
+        rng = np.random.default_rng(3)
+        data = squareform(pdist(rng.random((210, 120))))
+        grouping = [str(i % 70) for i in range(210)]
+        dm = DistanceMatrix(self.make_array(xp, device, data))
+        for test in ("centroid", "median"):
+            with self.subTest(test=test):
+                ref = permdisp(DistanceMatrix(data), grouping, test=test,
+                               permutations=99, dimensions=100, seed=0,
+                               engine="numba")
+                permdisp_gpu._kernels.clear()
+                res = permdisp(dm, grouping, test=test, permutations=99,
+                               dimensions=100, seed=0, engine="numba")
+                self.assertTrue(permdisp_gpu._kernels)
+                self.assertNotIn(_get_backend_name(xp), gpu_mod._unavailable)
+                self.assertAlmostEqual(res["test statistic"],
+                                       ref["test statistic"], places=7)
+                self.assertAlmostEqual(res["p-value"], ref["p-value"],
+                                       places=7)
+
+
+class PermdispGpuHostTests(TestCase):
+    """The GPU dispatch decisions that are checkable without a GPU."""
+
+    def setUp(self):
+        self.sample_data = np.arange(24, dtype=np.float64).reshape(8, 3)
+        self.codes = np.array([0, 0, 0, 0, 1, 1, 1, 1], dtype=np.int32)
+        # A real NumPy array, so _numba_gpu_module_for reports backend "numpy".
+        self.buf = np.zeros((8, 8))
+
+    @numba_code
+    def test_group_order(self):
+        # Each row's ranges must hold exactly that group's samples, in index
+        # order, including a group with no samples in the row.
+        block = np.array([[2, 0, 1, 0, 2], [0, 0, 0, 2, 2]], dtype=np.int32)
+        order, offsets = _group_order(block, 3)
+        npt.assert_array_equal(order, [[1, 3, 2, 0, 4], [0, 1, 2, 3, 4]])
+        npt.assert_array_equal(offsets, [[0, 2, 3, 5], [0, 3, 3, 5]])
+        for r in range(2):
+            for g in range(3):
+                idx = order[r, offsets[r, g]:offsets[r, g + 1]]
+                npt.assert_array_equal(idx, np.flatnonzero(block[r] == g))
+
+    def test_returns_none_without_gpu_module(self):
+        # NumPy is not a Numba GPU backend, so the helper declines and the
+        # caller runs the host engine instead. No patching: the decline is
+        # driven by the buffer's real backend.
+        self.assertIsNone(
+            _try_permdisp_gpu(self.buf, self.sample_data, self.codes, 2,
+                              9, 0, "median")
+        )
+
+    def test_gpu_negative_permutations_raises(self):
+        # The guard is shared with the host engine rather than living inside
+        # it, so the GPU path cannot accept a count the host path rejects.
+        with self.assertRaisesRegex(ValueError, "greater than or equal to zero"):
+            _try_permdisp_gpu(self.buf, self.sample_data, self.codes, 2,
+                              -1, 0, "median")
+
+    def test_gpu_non_float_median_raises(self):
+        # Same reason: engine and device must not change which inputs are legal.
+        ints = self.sample_data.astype(np.int64)
+        with self.assertRaisesRegex(TypeError, "np.float32 or np.float64"):
+            _try_permdisp_gpu(self.buf, ints, self.codes, 2, 9, 0, "median")
+
+    def test_kernel_shape_limits_are_inclusive(self):
+        # The maximum itself must be accepted and one past it refused. The
+        # dimension limit is what sizes the kernel's shared arrays.
+        self.assertTrue(_kernel_supports_shape(_MAX_DIMS))
+        self.assertFalse(_kernel_supports_shape(_MAX_DIMS + 1))
+
+    def test_kernel_sizes(self):
+        # Shared size: next power of two, at least 64. Tile: next power of
+        # two, kept between 8 and 64.
+        cases = {1: (64, 8), 5: (64, 8), 10: (64, 16), 16: (64, 16),
+                 20: (64, 32), 40: (64, 64), 64: (64, 64), 65: (128, 64),
+                 1024: (1024, 64)}
+        for dims, sizes in cases.items():
+            self.assertEqual(_kernel_sizes(dims), sizes)
+
+
+if __name__ == '__main__':
+    main()

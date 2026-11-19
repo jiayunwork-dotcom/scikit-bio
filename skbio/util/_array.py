@@ -1,0 +1,348 @@
+# ----------------------------------------------------------------------------
+# Copyright (c) 2013--, scikit-bio development team.
+#
+# Distributed under the terms of the Modified BSD License.
+#
+# The full license is in the file LICENSE.txt, distributed with this software.
+# ----------------------------------------------------------------------------
+
+"""Array-like objects and namespaces."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import numpy as np
+import array_api_compat as aac
+
+
+if TYPE_CHECKING:  # pragma: no cover
+    from types import ModuleType
+    from ._typing import ArrayLike, StdArray
+
+
+# -------------------------------------------------------------------------------------
+# Important note: This script provides support for array-like objects. Two notions are
+# currently used interchangeably in scikit-bio:
+#
+# 1. `np.typing.ArrayLike`: Used in most legacy code. It is usually converted into a
+#    NumPy array via `np.asarray`.
+#
+# 2. `skbio.util._array.StdArray`: Used in some new code that focuses on GPU support.
+#    It is essentially a union of NumPy array-like and array objects compliant with the
+#    Python array API standard. It is parsed using the `_get_array` function below.
+#
+# The two types and the two functions can be used interchangeably, but with certain
+# considerations, as detailed below.
+# -------------------------------------------------------------------------------------
+
+
+def _get_array(arr: ArrayLike, /, *, to_numpy: bool = False) -> StdArray:
+    r"""Convert an array-like variable into an array object.
+
+    Parameters
+    ----------
+    arr : array_like
+        An array-like variable.
+    to_numpy : bool, optional
+        If True, make sure the returned array is a NumPy array.
+
+    Returns
+    -------
+    arr : ndarray
+        An array object.
+
+    Notes
+    -----
+    When `to_numpy=True`, this function's behavior is very similar to `np.asarray`.
+    Therefore, in most legacy code, a simple `np.asarray` call can replace the
+    current function. However, there is a subtle difference that makes the current
+    function more suitable for GPU-oriented code: `np.asarray` forces a device-to-
+    host copy, whereas `np.from_dlpack` attempts to share the buffer without making
+    a copy, thereby improving performance.
+
+    """
+    # Cast a non-array object into a NumPy array.
+    if not aac.is_array_api_obj(arr):
+        arr = np.asarray(arr)
+
+    # Cast a non-NumPy array into a NumPy array.
+    elif to_numpy and not aac.is_numpy_array(arr):
+        # The Python array API standard requires any compliant array objects have a
+        # `__dlpack__` protocol, which guarantees that they can be converted into a
+        # NumPy array via `np.from_dlpack`.
+        # See: https://numpy.org/devdocs//user/basics.interoperability.html
+        try:
+            arr = np.from_dlpack(arr)
+
+        # For array objects that doesn't have the `__dlpack__` protocol (e.g., Dask,
+        # at the time of coding), or array objects that are not on the same device
+        # (e.g., cuda), `np.asarray` is called as a fallback, which should work for
+        # objects that have an `__array__` protocol. NumPy raises `BufferError`
+        # ("Unsupported device in DLTensor") for a GPU-resident buffer, so that
+        # must be caught here too, otherwise the device fallback never runs.
+        except (AttributeError, TypeError, RuntimeError, BufferError):
+            arr = _to_numpy(arr)
+
+    return arr
+
+
+# -------------------------------------------------------------------------------------
+# Array API backend helpers
+# -------------------------------------------------------------------------------------
+
+_BACKEND_CHECKERS = {
+    "numpy": aac.is_numpy_namespace,
+    "cupy": aac.is_cupy_namespace,
+    "torch": aac.is_torch_namespace,
+    "jax": aac.is_jax_namespace,
+    "dask": aac.is_dask_namespace,
+}
+
+
+# -------------------------------------------------------------------------------------
+# Conversion and device helpers (used primarily in testing)
+# -------------------------------------------------------------------------------------
+
+
+def _to_numpy(arr):
+    r"""Convert any array-API-compatible array to a NumPy array on CPU.
+
+    Unlike `_get_array(arr, to_numpy=True)`, this handles GPU arrays
+    explicitly without relying on `__dlpack__` or `__array__`, which can
+    fail for device arrays (e.g., `np.asarray` raises `RuntimeError` on a
+    PyTorch CUDA tensor).
+
+    Parameters
+    ----------
+    arr : array
+        Any array-API-compatible array object, or a NumPy array.
+
+    Returns
+    -------
+    numpy.ndarray
+        The data as a NumPy array on CPU.
+
+    Notes
+    -----
+    This is intended for use in **test assertions**, not in library functions.
+    Library functions should stay on the input device and use the `xp`
+    namespace throughout.
+
+    """
+    if isinstance(arr, np.ndarray):
+        return arr
+
+    # PyTorch: must detach from computation graph and move to CPU first.
+    # Without .detach().cpu(), np.asarray raises RuntimeError for CUDA tensors
+    # and tensors that require grad.
+    if hasattr(arr, "detach"):
+        return arr.detach().cpu().numpy()
+
+    # CuPy: .get() transfers GPU → CPU and returns a NumPy array.
+    if hasattr(arr, "get"):
+        return arr.get()
+
+    # JAX, Dask, and others: np.asarray works (JAX arrays are on-host by
+    # default; Dask triggers compute).
+    return np.asarray(arr)
+
+
+def _move_to_device(arr, xp, device):
+    r"""Move an array to the specified device.
+
+    Parameters
+    ----------
+    arr : array
+        An array-API-compatible array.
+    xp : module
+        The array namespace (e.g. `numpy`, `torch`, `jax.numpy`).
+    device : str or None
+        Target device string (`'cpu'`, `'cuda'`, `'gpu'`, etc.).
+        If `None` or `'cpu'`, the array is returned unchanged.
+
+    Returns
+    -------
+    array
+        The array on the requested device.
+
+    Notes
+    -----
+    This is intended for use in **test setup**, to place test data on the
+    correct device before calling the function under test.
+
+    """
+    if device is None or device == "cpu":
+        return arr
+
+    xp_name = xp.__name__.split(".")[0]
+
+    if xp_name == "torch":
+        return arr.to(device)
+
+    if xp_name == "jax":
+        import jax
+
+        dev = jax.devices(device)[0]
+        return jax.device_put(arr, dev)
+
+    # CuPy arrays are always on GPU; numpy arrays are always on CPU.
+    return arr
+
+
+def _get_backend_name(xp):
+    r"""Return a short backend name string for an array namespace.
+
+    Parameters
+    ----------
+    xp : module
+        An array namespace.
+
+    Returns
+    -------
+    str
+        One of `'numpy'`, `'torch'`, `'jax'`, `'cupy'`, `'dask'`,
+        or the raw module name if unrecognized.
+
+    """
+    for name, checker in _BACKEND_CHECKERS.items():
+        if checker(xp):
+            return name
+    return getattr(xp, "__name__", str(xp))
+
+
+# -------------------------------------------------------------------------------------
+# Main public helper
+# -------------------------------------------------------------------------------------
+
+
+def ingest_array(
+    *arrays: ArrayLike, to_numpy: bool = False
+) -> tuple[ModuleType, StdArray | ArrayLike]:
+    r"""Convert array-like variables into array objects and their shared namespace.
+
+    Parameters
+    ----------
+    *arrays : array_like
+        One or more array-like variables.
+    to_numpy : bool, optional
+        If True, make sure the returned arrays are NumPy arrays.
+
+    Returns
+    -------
+    xp : namespace
+        The array API compatible namespace corresponding `arrays`.
+    *arrays : object
+        One or more array objects that are consistent with `xp`.
+
+    See Also
+    --------
+    _get_array
+    skbio.util._typing.ArrayLike
+    array_api_compat.array_namespace
+    numpy.typing.ArrayLike
+    numpy.from_dlpack
+
+    Notes
+    -----
+    A compatible array-like object must be either:
+
+    1. An array object that is compatible with the Python array API standard [1]_.
+
+        * Examples are numpy.ndarray, cupy.ndarray, torch.Tensor, jax.Array,
+          dask.array.Array, and sparse.SparseArray.
+
+    2. An object that can be casted into a NumPy array [2]_.
+
+        * Examples are numpy.ndarray, Python list, tuple, array, and scalar.
+
+    `xp` is the namespace wrapper for different array libraries.
+
+    If the input `arr` is already a compatible object, it will be returned as-is.
+    Otherwise, it will be converted into a NumPy array.
+
+    References
+    ----------
+    .. [1] https://data-apis.org/array-api/latest/
+
+    .. [2] https://numpy.org/devdocs/glossary.html#term-array_like
+
+    """
+    arrays = tuple(_get_array(x, to_numpy=to_numpy) for x in arrays)
+    return aac.array_namespace(*arrays), *arrays
+
+
+def copy_array(arr: StdArray) -> StdArray:
+    r"""Return an independent copy of an array on its original device.
+
+    Parameters
+    ----------
+    arr : array
+        A NumPy array or an array object compliant with the Python array API
+        standard.
+
+    Returns
+    -------
+    array
+        A copy of `arr`, of the same type and on the same device.
+
+    See Also
+    --------
+    ingest_array
+
+    Notes
+    -----
+    For a NumPy array this is equivalent to ``arr.copy()``. For a non-NumPy
+    (e.g. GPU-resident) array it copies via the array's own namespace, keeping
+    the data on its original device rather than forcing a host copy.
+
+    """
+    if aac.is_numpy_array(arr):
+        return arr.copy()
+    return aac.array_namespace(arr).asarray(arr, copy=True)
+
+
+class ArrayWorkspace:
+    r"""Reuse named NumPy work arrays within one computation.
+
+    This workspace owns resizable backing arrays for temporary calculations.
+    Request an array by name, shape, and dtype with :meth:`get`. Its backing
+    storage grows when necessary and is reused by later requests with the same
+    name and dtype.
+
+    Arrays returned by this workspace are uninitialized scratch space. Their
+    contents may be overwritten by subsequent requests, so callers must copy
+    results that need to outlive the computation.
+
+    """
+
+    # TODO: Add array API and GPU support.
+
+    def __init__(self):
+        self.arrays = {}
+
+    def get(self, name, shape, dtype):
+        r"""Return an uninitialized work array with the requested specification.
+
+        Parameters
+        ----------
+        name : str
+            Identifier for the reusable array.
+        shape : tuple of int
+            Shape of the returned array.
+        dtype : data type
+            Data type of the returned array.
+
+        Returns
+        -------
+        ndarray
+            A contiguous array with the requested shape and dtype.
+
+        """
+        size = np.prod(shape)
+        old = self.arrays.get(name)
+        if old is None or old.dtype != dtype:
+            self.arrays[name] = np.empty(size, dtype=dtype)
+        elif old.size < size:
+            self.arrays[name] = np.empty(max(size, 2 * old.size), dtype=dtype)
+        return self.arrays[name][:size].reshape(shape)
