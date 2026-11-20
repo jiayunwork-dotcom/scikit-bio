@@ -17,6 +17,7 @@ from skbio.stats._misc import _pprint_strs
 from skbio.util._plotting import PlottableMixin
 from skbio.io.descriptors import Read, Write
 from skbio.table._tabular import _extract_row_ids
+from ._projection import project as _project_onto_state
 
 
 class OrdinationResults(SkbioObject, PlottableMixin):
@@ -53,6 +54,12 @@ class OrdinationResults(SkbioObject, PlottableMixin):
         Proportion explained by each of the dimensions in the ordination space.
         The index corresponds to the ordination axis labels. See
         :ref:`table_output` for details.
+    projection_state : ProjectionState or None
+        Reference configuration retained for projecting supplementary
+        samples into the ordination space with :meth:`project`. Only
+        present when the ordination was computed with
+        ``pcoa(..., projection=True)`` or read from an ``ordination`` file
+        containing a projection state section; otherwise ``None``.
     sample_ids, feature_ids, constraint_ids, output_format : optional
         Standard table parameters. See :ref:`table_params` for details.
 
@@ -84,6 +91,7 @@ class OrdinationResults(SkbioObject, PlottableMixin):
         sample_constraints=None,
         constraint_ids=None,
         proportion_explained=None,
+        projection_state=None,
     ):
         self.short_method_name = short_method_name
         self.long_method_name = long_method_name
@@ -107,6 +115,7 @@ class OrdinationResults(SkbioObject, PlottableMixin):
         self.sample_constraints = sample_constraints
         self.constraint_ids = constraint_ids
         self.proportion_explained = proportion_explained
+        self.projection_state = projection_state
 
     def __str__(self):
         """Return a string representation of the ordination results.
@@ -171,6 +180,155 @@ class OrdinationResults(SkbioObject, PlottableMixin):
         else:
             formatted_attr = formatter(attr)
         return "\t%s: %s" % (attr_label, formatted_attr)
+
+    def project(self, distances):
+        r"""Project supplementary samples into the ordination space.
+
+        Locate new ("supplementary") samples on the axes of this ordination
+        using only their distances to the reference samples, without
+        modifying the reference configuration. This requires the ordination
+        to carry a projection state, which is stored when the ordination is
+        computed with ``pcoa(..., projection=True)`` or read from an
+        ``ordination`` file containing a projection state section.
+
+        Parameters
+        ----------
+        distances : pd.DataFrame
+            Distances between the supplementary samples and the reference
+            samples. Row index labels are the supplementary sample IDs;
+            column labels are reference sample IDs. Columns may be a subset
+            of the references and may be given in any order. A cell value
+            of ``NaN`` marks a pair as unobserved (it is excluded, *not*
+            treated as zero distance). All other values must be
+            non-negative real numbers; zero (e.g. the distance of a
+            reference sample to itself) is a valid observation.
+
+        Returns
+        -------
+        ProjectionResult
+            A named tuple with two attributes:
+
+            ``coordinates`` : pd.DataFrame
+                Projected coordinates, row-indexed by the supplementary
+                sample IDs, with one column per retained ordination axis.
+                Rows with status ``"failed"`` contain ``NaN``.
+            ``diagnostics`` : pd.DataFrame
+                Per-sample diagnostics with columns ``n_valid`` (number of
+                observed distances), ``rank`` (affine rank of the observed
+                reference points), ``rms`` (root-mean-square residual of
+                the actual distances) and ``status`` (one of ``"ok"``,
+                ``"ambiguous"``, ``"underdetermined"`` or ``"failed"``).
+
+        Raises
+        ------
+        ValueError
+            If this ordination result does not store a projection state.
+        TypeError
+            If ``distances`` is not a pandas DataFrame.
+        ValueError
+            If ``distances`` has duplicated row or column labels, contains
+            columns that are not reference sample IDs, or contains values
+            that are not non-negative real numbers (bool, complex,
+            non-numeric, negative or infinite values are rejected).
+
+        See Also
+        --------
+        pcoa
+
+        Notes
+        -----
+        Each supplementary sample is located independently of all other
+        supplementary samples: a row's coordinates and diagnostics are
+        identical whether it is projected alone, together with other rows,
+        or in a different batch. The reference samples are not refitted and
+        their coordinates are never modified.
+
+        **Placement model.** Let :math:`x_1, \dots, x_n` be the fixed
+        reference coordinates in the retained :math:`k`-dimensional
+        ordination space. For observed distances :math:`d_i`, the position
+        :math:`y` minimizes the sum of squared residuals of the *actual*
+        (not squared) distances,
+
+        .. math::
+
+            f(y) = \sum_{i\ \mathrm{observed}}
+            \left( \lVert y - x_i \rVert - d_i \right)^2
+
+        solved by Levenberg-Marquardt (or a trust-region method when there
+        are fewer residuals than variables) from Gower's closed-form
+        interpolation formula, which is exact for mutually consistent
+        Euclidean distances, with deterministic fallback starting points.
+        The reported ``rms`` is computed from the residuals of the actual
+        distances, in the units of the input.
+
+        **What is sacrificed when no exact position exists.** When the
+        observed dissimilarities are not Euclidean-consistent (for example
+        non-Euclidean ecological dissimilarities, or a reference map that
+        keeps only the first few axes of a higher-dimensional geometry), no
+        point satisfies all observations, and the least-squares compromise
+        is returned instead: conflicting observations are averaged with
+        equal weights, and components of the true position orthogonal to
+        the retained axes are unrecoverable and inflate the residuals. The
+        ``rms`` diagnostic quantifies this misfit in distance units. When
+        the observed reference points do not affinely span the retained
+        space (fewer than :math:`k + 1` affinely independent observations,
+        or collinear/nearly degenerate configurations), the position is not
+        uniquely determined by the observations: the best-fit position is
+        still returned, but the status is ``"ambiguous"`` (one unspanned
+        direction, hence two mirror-image solutions) or
+        ``"underdetermined"`` (a continuum of solutions). If the solver
+        does not converge, the status is ``"failed"`` and no coordinates
+        are reported, rather than substituting zeros or an arbitrary finite
+        position. A failed row never affects the other rows of the batch.
+
+        Examples
+        --------
+        Define four reference samples at the corners of a rectangle and
+        compute their Euclidean distance matrix:
+
+        >>> import numpy as np
+        >>> import pandas as pd
+        >>> from skbio import DistanceMatrix
+        >>> from skbio.stats.ordination import pcoa
+        >>> refs = np.array([[ 2.0,  1.0],
+        ...                  [ 2.0, -1.0],
+        ...                  [-2.0,  1.0],
+        ...                  [-2.0, -1.0]])
+        >>> ids = ["r1", "r2", "r3", "r4"]
+        >>> dm = DistanceMatrix(
+        ...     np.sqrt(((refs[:, None] - refs) ** 2).sum(-1)), ids)
+
+        Fit PCoA, keeping both positive axes and storing the projection
+        state:
+
+        >>> ord_res = pcoa(dm, dimensions=2, projection=True)
+
+        A supplementary sample described only by its distances to the
+        reference samples is projected into the ordination (the recovered
+        position matches the true position (0.5, 0.3) up to the sign
+        ambiguity of the ordination axes):
+
+        >>> query = np.array([0.5, 0.3])
+        >>> dist = np.sqrt(((refs - query) ** 2).sum(-1))
+        >>> distances = pd.DataFrame([dist], index=["q1"], columns=ids)
+        >>> result = ord_res.project(distances)
+        >>> np.abs(result.coordinates.values.round(6))
+        array([[0.5, 0.3]])
+        >>> result.diagnostics[["n_valid", "rank", "status"]]
+           n_valid  rank status
+        q1       4     2     ok
+        >>> bool(result.diagnostics["rms"].iloc[0] < 1e-10)
+        True
+
+        """
+        if self.projection_state is None:
+            raise ValueError(
+                "This ordination result does not store a projection state, "
+                "so supplementary samples cannot be projected. Compute the "
+                "ordination with pcoa(..., projection=True), or read an "
+                "ordination file that contains a projection state section."
+            )
+        return _project_onto_state(self.projection_state, distances)
 
     def plot(
         self,

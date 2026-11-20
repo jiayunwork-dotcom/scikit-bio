@@ -19,6 +19,7 @@ from skbio.util import get_rng
 from skbio.stats.distance import DistanceMatrix
 from skbio.table._tabular import _create_table, _create_table_1d
 from ._ordination_results import OrdinationResults
+from ._projection import ProjectionState
 from ._utils import center_distance_matrix as center_distance_matrix_np, scale
 from skbio.binaries import (
     pcoa_fsvd_available as _skbb_pcoa_fsvd_available,
@@ -129,6 +130,7 @@ def pcoa(
     warn_neg_eigval=0.01,
     output_format=None,
     engine=None,
+    projection=False,
 ):
     r"""Perform Principal Coordinate Analysis (PCoA).
 
@@ -177,6 +179,20 @@ def pcoa(
         :ref:`compute_engines` for details.
 
         .. versionadded:: 0.7.4
+
+    projection : bool, optional
+        If True, store a projection state in the returned
+        ``OrdinationResults`` (see ``OrdinationResults.projection_state``),
+        which keeps the axes selected in this call fixed and enables
+        projecting supplementary samples into the ordination space via
+        ``OrdinationResults.project``, using only their distances to the
+        reference samples. Requires ``method='eigh'`` and a positive
+        integer ``dimensions``; requesting more axes than the number of
+        positive eigenvalues of the centered distance matrix raises an
+        error. Default is False, in which case the call behaves exactly as
+        before.
+
+        .. versionadded:: 0.7.5
 
     Returns
     -------
@@ -243,6 +259,26 @@ def pcoa(
     """
     # this converts to redundant form, regardless of input type
     distmat = DistanceMatrix(distmat)
+
+    if projection:
+        # Fail fast before any decomposition, and never silently switch
+        # algorithms: the projection state is only defined for the exact
+        # eigendecomposition with an explicitly chosen number of axes.
+        if method != "eigh":
+            raise ValueError(
+                "projection=True requires method='eigh' (got %r). The "
+                "projection state is only supported with exact "
+                "eigendecomposition." % (method,)
+            )
+        if (
+            isinstance(dimensions, bool)
+            or not isinstance(dimensions, Integral)
+            or dimensions < 1
+        ):
+            raise ValueError(
+                "projection=True requires dimensions to be a positive "
+                "integer (got %r)." % (dimensions,)
+            )
 
     # If no dimension specified, by default will compute all eigenvectors
     # and eigenvalues
@@ -427,6 +463,19 @@ def pcoa(
     eigvals = xp.where(mask, eigvals, 0)
     eigvecs = eigvecs * mask
 
+    if projection and not bool(eigvals[dimensions - 1] > 0):
+        # The projection state may only retain axes with positive
+        # eigenvalues. Requesting more axes than the effective positive
+        # rank of the centered distance matrix (e.g. because the distances
+        # are non-Euclidean or exactly low-rank) is rejected explicitly.
+        raise ValueError(
+            "projection=True requires all %d retained axes to have "
+            "positive eigenvalues, but axis %d has eigenvalue %s. The "
+            "distance matrix has fewer than %d positive eigenvalues; "
+            "reduce dimensions."
+            % (dimensions, dimensions, float(eigvals[dimensions - 1]), dimensions)
+        )
+
     if ndim != distmat.data.shape[0]:
         # Since the dimension parameter, hereafter referred to as 'd',
         # restricts the number of eigenvalues and eigenvectors that FSVD
@@ -478,11 +527,18 @@ def pcoa(
         proportion_explained,
         distmat.ids,
         output_format,
+        projection=projection,
     )
 
 
 def _encapsulate_pcoa_result(
-    long_method_name, eigvals, coordinates, proportion_explained, ids, output_format
+    long_method_name,
+    eigvals,
+    coordinates,
+    proportion_explained,
+    ids,
+    output_format,
+    projection=False,
 ):
     r"""Format PCoA results
 
@@ -503,6 +559,9 @@ def _encapsulate_pcoa_result(
         Distance matrix ids
     output_format : optional
         Standard table parameters. See :ref:`table_params` for details.
+    projection : bool, optional
+        Whether to attach a projection state (the reference axes fixed by
+        this call) to the result, enabling ``OrdinationResults.project``.
 
     Returns
     -------
@@ -517,6 +576,18 @@ def _encapsulate_pcoa_result(
 
     dimensions = eigvals.shape[0]
     axis_labels = ["PC%d" % i for i in range(1, dimensions + 1)]
+    projection_state = None
+    if projection:
+        # Freeze the axes selected in this call: the state carries its own
+        # float64 NumPy copy of the reference coordinates so that later
+        # modifications of the samples table cannot move the fixed axes.
+        projection_state = ProjectionState(
+            ids=ids,
+            coordinates=np.array(
+                _to_numpy(coordinates), dtype=np.float64, copy=True
+            ),
+            axis_labels=axis_labels,
+        )
     return OrdinationResults(
         short_method_name="PCoA",
         long_method_name=long_method_name,
@@ -530,6 +601,7 @@ def _encapsulate_pcoa_result(
         proportion_explained=_create_table_1d(
             proportion_explained, index=axis_labels, backend=output_format
         ),
+        projection_state=projection_state,
     )
 
 

@@ -7,17 +7,25 @@
 # ----------------------------------------------------------------------------
 
 import io
+import os
+import subprocess
+import sys
+import tempfile
 from unittest import TestCase, main
 
 import numpy as np
 import pandas as pd
+import pandas.testing as pdt
 import numpy.testing as npt
 
-from skbio import OrdinationResults
+import skbio
+from skbio import DistanceMatrix, OrdinationResults
 from skbio.io import OrdinationFormatError
 from skbio.io.format.ordination import (
     _ordination_to_ordination_results, _ordination_results_to_ordination,
     _ordination_sniffer)
+from skbio.stats.ordination import pcoa
+from skbio.stats.ordination._projection import ProjectionState
 from skbio.util import get_data_path, assert_ordination_results_equal, assert_ordination_results_equal_np
 from skbio._config import set_config
 
@@ -311,6 +319,306 @@ class SnifferTests(OrdinationTestData):
         for fp, _, expected_sniffer_match in self.invalid_fps:
             self.assertEqual(_ordination_sniffer(fp),
                              (expected_sniffer_match, {}))
+
+
+class ProjectionStateTestData(TestCase):
+    """Shared fixtures for the optional ``Projection state`` section."""
+
+    def setUp(self):
+        # references at the corners of a 4x2 rectangle (hand-computable)
+        self.refs = np.array(
+            [[2.0, 1.0], [2.0, -1.0], [-2.0, 1.0], [-2.0, -1.0]]
+        )
+        self.ids = ["r1", "r2", "r3", "r4"]
+        d = np.sqrt(((self.refs[:, None] - self.refs) ** 2).sum(-1))
+        self.dm = DistanceMatrix(d, self.ids)
+        self.res = pcoa(self.dm, dimensions=2, projection=True)
+
+        query = np.array([0.5, 0.3])
+        dist = np.sqrt(((self.refs - query) ** 2).sum(-1))
+        self.distances = pd.DataFrame([dist], index=["q1"], columns=self.ids)
+
+    def _write_str(self, obj):
+        fh = io.StringIO()
+        _ordination_results_to_ordination(obj, fh)
+        return fh.getvalue()
+
+    def _read_str(self, content):
+        return _ordination_to_ordination_results(io.StringIO(content))
+
+    def _state_section(self, content):
+        """The part of a serialized result following 'Projection state'."""
+        marker = "Projection state"
+        idx = content.index(marker)
+        return content[idx:]
+
+
+class ProjectionStateReaderWriterTests(ProjectionStateTestData):
+    def test_roundtrip_in_process(self):
+        content = self._write_str(self.res)
+        self.assertIn("Projection state\t1\t4\t2\n", content)
+        obs = self._read_str(content)
+
+        state = obs.projection_state
+        self.assertIsNotNone(state)
+        self.assertEqual(tuple(state.ids), tuple(self.ids))
+        self.assertEqual(tuple(state.axis_labels), ("PC1", "PC2"))
+        npt.assert_array_equal(
+            state.coordinates, self.res.projection_state.coordinates
+        )
+
+        # project before and after the round-trip: identical coordinates
+        # and diagnostics
+        before = self.res.project(self.distances)
+        after = obs.project(self.distances)
+        pdt.assert_frame_equal(before.coordinates, after.coordinates)
+        pdt.assert_frame_equal(before.diagnostics, after.diagnostics)
+
+    def test_read_static_file(self):
+        # a file written by a previous run remains readable and usable
+        obs = _ordination_to_ordination_results(
+            get_data_path("ordination_projection_state")
+        )
+        state = obs.projection_state
+        self.assertIsNotNone(state)
+        self.assertEqual(tuple(state.ids), tuple(self.ids))
+        self.assertEqual(state.coordinates.shape, (4, 2))
+        out = obs.project(self.distances)
+        npt.assert_allclose(
+            out.coordinates.values, [[-0.5, -0.3]], atol=1e-9
+        )
+        self.assertEqual(out.diagnostics.iloc[0]["status"], "ok")
+
+    def test_sniffer_matches_file_with_state(self):
+        self.assertEqual(
+            _ordination_sniffer(
+                get_data_path("ordination_projection_state")
+            ),
+            (True, {}),
+        )
+
+    def test_write_without_state_unchanged(self):
+        # results without a projection state produce the pre-existing
+        # format: no extra section, readable as a plain result
+        res = pcoa(self.dm, dimensions=2)
+        self.assertIsNone(res.projection_state)
+        content = self._write_str(res)
+        self.assertNotIn("Projection state", content)
+        obs = self._read_str(content)
+        self.assertIsNone(obs.projection_state)
+        assert_ordination_results_equal(
+            obs, res, ignore_method_names=True, ignore_axis_labels=True
+        )
+
+    def test_old_file_reads_as_plain_result(self):
+        obs = _ordination_to_ordination_results(
+            get_data_path("ordination_PCoA_sample_data_3_scores")
+        )
+        self.assertIsNone(obs.projection_state)
+        with self.assertRaisesRegex(ValueError, "projection state"):
+            obs.project(self.distances)
+
+    def test_trailing_blank_line_tolerated(self):
+        res = pcoa(self.dm, dimensions=2)
+        content = self._write_str(res) + "\n"
+        obs = self._read_str(content)
+        self.assertIsNone(obs.projection_state)
+
+    def test_writer_rejects_inconsistent_state(self):
+        res = pcoa(self.dm, dimensions=2)
+        # a state whose reference IDs do not match the samples
+        res.projection_state = ProjectionState(
+            ids=["x1", "x2", "x3", "x4"],
+            coordinates=np.zeros((4, 2)),
+            axis_labels=["PC1", "PC2"],
+        )
+        with self.assertRaisesRegex(ValueError, "do not match"):
+            self._write_str(res)
+        # a state whose dimensionality does not match the ordination axes
+        res.projection_state = ProjectionState(
+            ids=self.ids,
+            coordinates=np.zeros((4, 3)),
+            axis_labels=["PC1", "PC2", "PC3"],
+        )
+        with self.assertRaisesRegex(ValueError, "dimension"):
+            self._write_str(res)
+
+    def test_corrupted_projection_state_rejected(self):
+        content = self._write_str(self.res)
+        no_state = self._write_str(pcoa(self.dm, dimensions=2))
+
+        def mutate_content(old, new, count=1):
+            self.assertIn(old, content)
+            return content.replace(old, new, count)
+
+        def mutate_state(old, new, count=1):
+            section = self._state_section(content)
+            self.assertIn(old, section)
+            head = content[: content.index("Projection state")]
+            return head + section.replace(old, new, count)
+
+        cases = [
+            # unknown or malformed version
+            (mutate_content("Projection state\t1\t", "Projection state\t99\t"),
+             r"Unsupported projection state version: 99"),
+            (mutate_content("Projection state\t1\t", "Projection state\tx\t"),
+             r"version is not an integer"),
+            # size constraints inconsistent with the rest of the file
+            (mutate_content("Projection state\t1\t4\t2",
+                            "Projection state\t1\t3\t2"),
+             r"lists 3 reference\(s\), but the Site section lists 4"),
+            (mutate_content("Projection state\t1\t4\t2",
+                            "Projection state\t1\t4\t3"),
+             r"has 3 dimension\(s\), but there are 2 eigvals"),
+            (mutate_content("Projection state\t1\t4\t2",
+                            "Projection state\t1\t0\t2"),
+             r"must be positive: 0 x 2"),
+            (mutate_content("Projection state\t1\t4\t2",
+                            "Projection state\t1\t4\tx"),
+             r"dimensions are not integers"),
+            # truncated content
+            (content[: content.index("PC1\tPC2")],
+             r"end of file.*axis labels"),
+            (content[: content.index("Projection state")]
+             + self._state_section(content)[
+                 : self._state_section(content).index("r3\t")],
+             r"end of file.*row 3.*Projection state"),
+            # reference IDs inconsistent with the numeric state / sites
+            (mutate_state("r3\t", "rX\t"),
+             r"reference IDs do not match the Site IDs"),
+            # malformed numeric content
+            (mutate_state("PC1\tPC2", "PC1\tPC2\tPC3"),
+             r"Expected 2 axis labels"),
+            (mutate_state("r3\t2.0\t-1.0", "r3\t2.0"),
+             r"Expected 2 values, but found 1 in row 3"),
+            (mutate_state("r3\t2.0\t-1.0", "r3\tabc\t-1.0"),
+             r"non-numeric"),
+            (mutate_state("r3\t2.0\t-1.0", "r3\tnan\t-1.0"),
+             r"must be finite"),
+            (mutate_state("r3\t2.0\t-1.0", "r3\tinf\t-1.0"),
+             r"must be finite"),
+            # trailing content after the state
+            (content + "junk\n",
+             r"Unexpected content after the Projection state section"),
+            # junk after the Site constraints section
+            (no_state + "junk\n",
+             r"Expected an empty line after the Site constraints section"),
+            (no_state + "\nSomething\t1\n",
+             r"Projection state header not found"),
+        ]
+        for bad_content, error_msg_regexp in cases:
+            with self.assertRaisesRegex(OrdinationFormatError,
+                                        error_msg_regexp):
+                self._read_str(bad_content)
+
+    def test_state_size_grows_linearly_with_references(self):
+        # the serialized state stores one row of coordinates per reference
+        # (plus a constant header): for a fixed number of axes its size
+        # grows linearly, not quadratically, with the reference count
+        sizes = []
+        for n in (30, 60, 120):
+            rng = np.random.default_rng(0)
+            refs = rng.normal(size=(n, 3))
+            ids = ["s%d" % i for i in range(n)]
+            dm = DistanceMatrix(
+                np.sqrt(((refs[:, None] - refs) ** 2).sum(-1)), ids
+            )
+            res = pcoa(dm, dimensions=3, projection=True)
+            self.assertEqual(res.projection_state.coordinates.shape, (n, 3))
+            sizes.append(len(self._write_str(res)))
+        inc1 = sizes[1] - sizes[0]
+        inc2 = sizes[2] - sizes[1]
+        self.assertGreater(inc1, 0)
+        # linear growth doubles the increment when n doubles; quadratic
+        # growth would roughly quadruple it
+        self.assertGreater(inc2 / inc1, 1.5)
+        self.assertLess(inc2 / inc1, 2.5)
+
+
+class ProjectionStateFreshProcessTests(ProjectionStateTestData):
+    """Round-trip through a file consumed by a fresh Python process."""
+
+    def setUp(self):
+        super().setUp()
+        # rows exercising success, partial and total missingness, and a
+        # geometrically underdetermined row
+        full = np.sqrt(((self.refs - [0.5, 0.3]) ** 2).sum(-1))
+        partial = full.copy()
+        partial[1] = np.nan
+        single = np.full(4, np.nan)
+        single[2] = full[2]
+        none = np.full(4, np.nan)
+        self.batch = pd.DataFrame(
+            [full, partial, single, none],
+            index=["q1", "q2", "q3", "q4"],
+            columns=self.ids,
+        )
+        self.expected = self.res.project(self.batch)
+
+    def _run_worker(self, ordination_fp, distances_fp, out_fp, cwd):
+        worker = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "_projection_worker.py",
+        )
+        env = dict(os.environ)
+        repo_root = os.path.dirname(
+            os.path.dirname(os.path.abspath(skbio.__file__))
+        )
+        env["PYTHONPATH"] = (
+            repo_root + os.pathsep + env.get("PYTHONPATH", "")
+        )
+        return subprocess.run(
+            [sys.executable, worker, ordination_fp, distances_fp, out_fp],
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_fresh_process_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ordination_fp = os.path.join(tmp, "ordination.txt")
+            distances_fp = os.path.join(tmp, "distances.csv")
+            out_fp = os.path.join(tmp, "out.csv")
+            with open(ordination_fp, "w") as fh:
+                self.res.write(fh)
+            self.batch.to_csv(distances_fp)
+
+            # run from a different working directory so that only the
+            # serialized file (no in-memory object, no original distance
+            # matrix) can inform the projection
+            proc = self._run_worker(
+                ordination_fp, distances_fp, out_fp, cwd=tmp
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            with open(out_fp) as fh:
+                observed = fh.read()
+
+        expected = io.StringIO()
+        self.expected.coordinates.to_csv(expected)
+        expected.write("\n")
+        self.expected.diagnostics.to_csv(expected)
+        self.assertEqual(observed, expected.getvalue())
+
+        # sanity check on the contents: statuses and NaN semantics survive
+        self.assertIn("ok", observed)
+        self.assertIn("underdetermined", observed)
+
+    def test_fresh_process_plain_result_has_no_state(self):
+        plain = pcoa(self.dm, dimensions=2)
+        with tempfile.TemporaryDirectory() as tmp:
+            ordination_fp = os.path.join(tmp, "ordination.txt")
+            distances_fp = os.path.join(tmp, "distances.csv")
+            out_fp = os.path.join(tmp, "out.csv")
+            with open(ordination_fp, "w") as fh:
+                plain.write(fh)
+            self.batch.to_csv(distances_fp)
+            proc = self._run_worker(
+                ordination_fp, distances_fp, out_fp, cwd=tmp
+            )
+            self.assertEqual(proc.returncode, 3, msg=proc.stderr)
+            self.assertIn("projection state", proc.stdout)
+            self.assertFalse(os.path.exists(out_fp))
 
 
 if __name__ == '__main__':

@@ -98,6 +98,24 @@ be defined and declare its dimensions as 0. For example::
 
 All attributes are optional except for ``Eigvals``.
 
+Optionally, a final ``Projection state`` section may follow the
+``Site constraints`` section (separated from it by a blank line). It stores
+the fixed reference configuration that enables projecting supplementary
+samples into the ordination space with
+:meth:`skbio.stats.ordination.OrdinationResults.project`. The section is
+only present in results computed with ``pcoa(..., projection=True)``;
+files without it are read as ordinary ordination results. The section
+consists of a header line::
+
+    Projection state<tab>version<tab>n_references<tab>n_dimensions
+
+followed by one line of ``n_dimensions`` tab-separated axis labels, and
+``n_references`` lines, each storing a reference sample ID followed by its
+``n_dimensions`` tab-separated coordinates. The reference IDs must match
+the ``Site`` IDs in order, and ``n_dimensions`` must equal the number of
+``Eigvals``. The only supported ``version`` is currently 1; files carrying
+an unknown version, truncated or mismatched content are rejected.
+
 Examples
 --------
 Assume we have the following tab-delimited text file storing the
@@ -189,6 +207,10 @@ Load the ordination results from the file:
 import numpy as np
 
 from skbio.stats.ordination import OrdinationResults
+from skbio.stats.ordination._projection import (
+    ProjectionState,
+    PROJECTION_STATE_VERSION,
+)
 from skbio.io import create_format, OrdinationFormatError
 from skbio.table._tabular import _create_table, _create_table_1d
 
@@ -251,6 +273,10 @@ def _ordination_to_ordination_results(fh, cls=None):
                 % (cons.index, site.index)
             )
 
+    projection_state = _parse_projection_state_section(
+        fh, sample_ids, eigvals.shape[-1]
+    )
+
     return cls(
         short_method_name="",
         long_method_name="",
@@ -262,6 +288,131 @@ def _ordination_to_ordination_results(fh, cls=None):
         biplot_scores=biplot,
         sample_constraints=cons,
         proportion_explained=prop_expl,
+        projection_state=projection_state,
+    )
+
+
+def _parse_projection_state_section(fh, sample_ids, num_eigvals):
+    """Parse the optional ``Projection state`` section.
+
+    Returns None when the file ends after the ``Site constraints``
+    section (ordinary ordination results). Raises
+    ``OrdinationFormatError`` when a projection state section is present
+    but malformed, truncated, carries an unknown version, or does not
+    match the reference (site) IDs and dimensions of the result.
+    """
+    line = next(fh, None)
+    if line is None:
+        # End of file right after the Site constraints section: no
+        # projection state (the ordinary, pre-existing format).
+        return None
+    if line.strip():
+        raise OrdinationFormatError(
+            "Expected an empty line after the Site constraints section, "
+            "found: %r." % line.strip()
+        )
+    line = next(fh, None)
+    if line is None:
+        # Tolerate a trailing blank line at end of file.
+        return None
+
+    header = line.strip().split("\t")
+    if len(header) != 4 or header[0] != "Projection state":
+        raise OrdinationFormatError(
+            "Projection state header not found (found %r). The ordination "
+            "format does not allow other trailing sections." % line.strip()
+        )
+    try:
+        version = int(header[1])
+    except ValueError:
+        raise OrdinationFormatError(
+            "Projection state version is not an integer: %r." % header[1]
+        )
+    if version != PROJECTION_STATE_VERSION:
+        raise OrdinationFormatError(
+            "Unsupported projection state version: %d. This version of "
+            "scikit-bio supports version %d."
+            % (version, PROJECTION_STATE_VERSION)
+        )
+    try:
+        num_refs = int(header[2])
+        num_dims = int(header[3])
+    except ValueError:
+        raise OrdinationFormatError(
+            "Projection state dimensions are not integers: %r, %r."
+            % (header[2], header[3])
+        )
+    if num_refs < 1 or num_dims < 1:
+        raise OrdinationFormatError(
+            "Projection state dimensions must be positive: %d x %d."
+            % (num_refs, num_dims)
+        )
+    if sample_ids is None or num_refs != len(sample_ids):
+        raise OrdinationFormatError(
+            "Projection state lists %d reference(s), but the Site section "
+            "lists %s."
+            % (num_refs, "none" if sample_ids is None else len(sample_ids))
+        )
+    if num_dims != num_eigvals:
+        raise OrdinationFormatError(
+            "Projection state has %d dimension(s), but there are %d "
+            "eigvals." % (num_dims, num_eigvals)
+        )
+
+    line = next(fh, None)
+    if line is None:
+        raise OrdinationFormatError(
+            "Reached end of file while looking for the axis labels of the "
+            "Projection state section."
+        )
+    axis_labels = tuple(line.strip().split("\t"))
+    if len(axis_labels) != num_dims:
+        raise OrdinationFormatError(
+            "Expected %d axis labels in the Projection state section, but "
+            "found %d." % (num_dims, len(axis_labels))
+        )
+
+    data = np.empty((num_refs, num_dims), dtype=np.float64)
+    ids = []
+    for i in range(num_refs):
+        line = next(fh, None)
+        if line is None:
+            raise OrdinationFormatError(
+                "Reached end of file while looking for row %d in "
+                "Projection state section." % (i + 1)
+            )
+        vals = line.strip().split("\t")
+        ids.append(vals[0])
+        vals = vals[1:]
+        if len(vals) != num_dims:
+            raise OrdinationFormatError(
+                "Expected %d values, but found %d in row %d of the "
+                "Projection state section." % (num_dims, len(vals), i + 1)
+            )
+        try:
+            data[i, :] = np.asarray(vals, dtype=np.float64)
+        except ValueError:
+            raise OrdinationFormatError(
+                "Projection state row %d contains non-numeric coordinates."
+                % (i + 1)
+            )
+
+    if not np.isfinite(data).all():
+        raise OrdinationFormatError(
+            "Projection state coordinates must be finite numbers."
+        )
+    if ids != list(sample_ids):
+        raise OrdinationFormatError(
+            "Projection state reference IDs do not match the Site IDs: "
+            "%s != %s" % (ids, list(sample_ids))
+        )
+    if next(fh, None) is not None:
+        raise OrdinationFormatError(
+            "Unexpected content after the Projection state section."
+        )
+
+    return ProjectionState(
+        ids=ids, coordinates=data, axis_labels=axis_labels, version=version
     )
 
 
@@ -399,6 +550,47 @@ def _ordination_results_to_ordination(obj, fh):
         ids=obj.sample_ids,
         include_section_separator=False,
     )
+    state = getattr(obj, "projection_state", None)
+    if state is not None:
+        _write_projection_state_section(fh, obj, state)
+
+
+def _write_projection_state_section(fh, obj, state):
+    """Write the optional ``Projection state`` section.
+
+    The section is only written when the object carries a projection
+    state, so results without one produce byte-identical output to the
+    pre-existing format. The state must be consistent with the result it
+    is attached to: its reference IDs must equal the sample IDs, and its
+    dimensions must match the ordination axes.
+    """
+    num_refs = len(state.ids)
+    num_dims = state.coordinates.shape[1]
+    if obj.sample_ids is None or list(obj.sample_ids) != list(state.ids):
+        raise ValueError(
+            "The projection state reference IDs do not match the sample "
+            "IDs of the ordination results; refusing to serialize an "
+            "inconsistent projection state."
+        )
+    if obj.samples is None or obj.samples.shape[1] != num_dims:
+        raise ValueError(
+            "The projection state has %d dimension(s), but the samples "
+            "table of the ordination results does not match."
+            % num_dims
+        )
+    if obj.eigvals is None or len(obj.eigvals) != num_dims:
+        raise ValueError(
+            "The projection state has %d dimension(s), but the ordination "
+            "results do not have the same number of eigvals." % num_dims
+        )
+    fh.write("\n")
+    fh.write(
+        "Projection state\t%d\t%d\t%d\n"
+        % (state.version, num_refs, num_dims)
+    )
+    fh.write("\t".join(str(label) for label in state.axis_labels) + "\n")
+    for id_, vals in zip(state.ids, state.coordinates):
+        fh.write(_format_vector(vals, id_))
 
 
 def _write_vector_section(fh, header_id, vector):
