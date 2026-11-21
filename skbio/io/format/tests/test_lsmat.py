@@ -8,8 +8,10 @@
 
 import io
 from unittest import TestCase, main
+from unittest.mock import patch
 
 import numpy as np
+import numpy.testing as npt
 
 from skbio import DistanceMatrix
 from skbio.io import LSMatFormatError
@@ -231,6 +233,216 @@ class PairwiseAndDistanceMatrixReaderWriterTests(LSMatTestData):
                 out_fh.close()
 
                 self.assertEqual(lsmat1, lsmat2)
+
+
+class CondensedMatrixWriterTests(TestCase):
+    """Writing condensed (1-D) storage must match redundant (2-D) storage."""
+
+    def setUp(self):
+        # The reported failure: condensed DistanceMatrix raised TypeError on
+        # write. Upper triangle 1..6 across samples a, b, c, d.
+        self.ids = ["a", "b", "c", "d"]
+        self.condensed = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        self.square = [[0.0, 1.0, 2.0, 3.0],
+                       [1.0, 0.0, 4.0, 5.0],
+                       [2.0, 4.0, 0.0, 6.0],
+                       [3.0, 5.0, 6.0, 0.0]]
+        self.exp_text = (
+            "\ta\tb\tc\td\n"
+            "a\t0.0\t1.0\t2.0\t3.0\n"
+            "b\t1.0\t0.0\t4.0\t5.0\n"
+            "c\t2.0\t4.0\t0.0\t6.0\n"
+            "d\t3.0\t5.0\t6.0\t0.0\n"
+        )
+
+    def write_str(self, obj, **kwargs):
+        fh = io.StringIO()
+        obj.write(fh, format="lsmat", **kwargs)
+        value = fh.getvalue()
+        fh.close()
+        return value
+
+    def test_condensed_distance_matrix(self):
+        dm = DistanceMatrix(self.condensed, ids=self.ids, condensed=True)
+        self.assertEqual(self.write_str(dm), self.exp_text)
+
+    def test_condensed_distance_matrix_float32(self):
+        dm = DistanceMatrix(np.asarray(self.condensed, dtype="float32"),
+                            ids=self.ids, condensed=True)
+        self.assertEqual(dm.dtype, np.float32)
+        self.assertEqual(self.write_str(dm), self.exp_text)
+
+    def test_condensed_matches_redundant_text(self):
+        dm_cond = DistanceMatrix(self.condensed, ids=self.ids, condensed=True)
+        dm_red = DistanceMatrix(self.square, ids=self.ids)
+        self.assertEqual(self.write_str(dm_cond), self.write_str(dm_red))
+
+    def test_condensed_symmetric_scalar_diagonal(self):
+        sm = SymmetricMatrix(self.condensed, ids=self.ids, condensed=True,
+                             diagonal=11.0)
+        exp = self.exp_text.replace("0.0", "11.0")
+        self.assertEqual(self.write_str(sm), exp)
+
+    def test_condensed_symmetric_array_diagonal(self):
+        sm = SymmetricMatrix(self.condensed, ids=self.ids, condensed=True,
+                             diagonal=[11.0, 12.0, 13.0, 14.0])
+        exp = (
+            "\ta\tb\tc\td\n"
+            "a\t11.0\t1.0\t2.0\t3.0\n"
+            "b\t1.0\t12.0\t4.0\t5.0\n"
+            "c\t2.0\t4.0\t13.0\t6.0\n"
+            "d\t3.0\t5.0\t6.0\t14.0\n"
+        )
+        self.assertEqual(self.write_str(sm), exp)
+        # same logical matrix stored redundantly writes identical text
+        sm_red = SymmetricMatrix(
+            [[11.0, 1.0, 2.0, 3.0],
+             [1.0, 12.0, 4.0, 5.0],
+             [2.0, 4.0, 13.0, 6.0],
+             [3.0, 5.0, 6.0, 14.0]], ids=self.ids)
+        self.assertEqual(self.write_str(sm), self.write_str(sm_red))
+
+    def test_single_sample(self):
+        cases = [
+            (DistanceMatrix([[0.0]], ids=["a"]), "\ta\na\t0.0\n"),
+            (DistanceMatrix([], ids=["a"], condensed=True), "\ta\na\t0.0\n"),
+            (SymmetricMatrix([], ids=["a"], condensed=True, diagonal=5.0),
+             "\ta\na\t5.0\n"),
+        ]
+        for obj, exp in cases:
+            self.assertEqual(self.write_str(obj), exp)
+
+    def test_all_zero(self):
+        dm = DistanceMatrix([0.0, 0.0, 0.0], ids=["a", "b", "c"],
+                            condensed=True)
+        exp = "\ta\tb\tc\na\t0.0\t0.0\t0.0\nb\t0.0\t0.0\t0.0\nc\t0.0\t0.0\t0.0\n"
+        self.assertEqual(self.write_str(dm), exp)
+
+    def test_pairwise_asymmetric_unchanged(self):
+        pm = PairwiseMatrix([[0.0, 1.0], [-2.0, 0.0]], ids=["a", "b"])
+        exp = "\ta\tb\na\t0.0\t1.0\nb\t-2.0\t0.0\n"
+        self.assertEqual(self.write_str(pm), exp)
+
+    def test_filter_reorder_then_write(self):
+        dm = DistanceMatrix(self.condensed, ids=self.ids, condensed=True)
+        sub = dm.filter(["c", "a"])
+        self.assertTrue(sub._flags["CONDENSED"])
+        exp = "\tc\ta\nc\t0.0\t2.0\na\t2.0\t0.0\n"
+        self.assertEqual(self.write_str(sub), exp)
+
+    def test_permute_then_write(self):
+        dm = DistanceMatrix(self.condensed, ids=self.ids, condensed=True)
+        perm = dm.permute(seed=42)
+        self.assertTrue(perm._flags["CONDENSED"])
+        # IDs are kept in place; only values are permuted
+        self.assertEqual(perm.ids, dm.ids)
+        text = self.write_str(perm)
+        obs = DistanceMatrix.read(io.StringIO(text), format="lsmat")
+        npt.assert_array_equal(obs.redundant_form(), perm.redundant_form())
+
+    def test_copy_then_write(self):
+        dm = DistanceMatrix(self.condensed, ids=self.ids, condensed=True)
+        self.assertEqual(self.write_str(dm.copy()), self.exp_text)
+
+    def test_small_segment_cap_same_output(self):
+        # Force the writer through many small segments; output must be
+        # identical to the default-cap write.
+        dm = DistanceMatrix(self.condensed, ids=self.ids, condensed=True)
+        with patch("skbio.io.format.lsmat._DELIMITED_SEG_CAP", 1):
+            obs = self.write_str(dm)
+        self.assertEqual(obs, self.exp_text)
+
+    def test_roundtrip_condensed(self):
+        dm = DistanceMatrix(self.condensed, ids=self.ids, condensed=True)
+        text = self.write_str(dm)
+        obs = DistanceMatrix.read(io.StringIO(text), format="lsmat")
+        npt.assert_array_equal(obs.redundant_form(), dm.redundant_form())
+        self.assertEqual(obs.ids, dm.ids)
+
+    def test_source_not_mutated(self):
+        dm = DistanceMatrix(self.condensed, ids=self.ids, condensed=True)
+        data_before = dm.data
+        snapshot = dm.data.copy()
+        self.write_str(dm)
+        self.assertIs(dm.data, data_before)
+        self.assertTrue(dm._flags["CONDENSED"])
+        self.assertEqual(dm.ids, tuple(self.ids))
+        npt.assert_array_equal(dm.data, snapshot)
+
+    def test_source_not_mutated_on_error(self):
+        class FailingFH(io.StringIO):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def write(self, s):
+                self.calls += 1
+                if self.calls > 2:
+                    raise OSError("simulated write failure")
+                return super().write(s)
+
+        sm = SymmetricMatrix(self.condensed, ids=self.ids, condensed=True,
+                             diagonal=[11.0, 12.0, 13.0, 14.0])
+        data_before = sm.data
+        snapshot = sm.data.copy()
+        with self.assertRaises(OSError):
+            sm.write(FailingFH(), format="lsmat")
+        self.assertIs(sm.data, data_before)
+        self.assertTrue(sm._flags["CONDENSED"])
+        self.assertEqual(sm.ids, tuple(self.ids))
+        npt.assert_array_equal(sm.data, snapshot)
+        npt.assert_array_equal(np.asarray(sm.diagonal),
+                               [11.0, 12.0, 13.0, 14.0])
+
+    def test_large_condensed_allocation_record(self):
+        # A larger condensed input is exported with bounded auxiliary
+        # memory: one scratch bundle plus transient per-segment string
+        # arrays, all far below 8 MiB and not growing with n^2.
+        n = 1200
+        rng = np.random.default_rng(3)
+        cond = rng.random(n * (n - 1) // 2)
+        dm = DistanceMatrix(cond, condensed=True)
+
+        scratch_records = []
+        str_records = []
+        import skbio.stats.distance._base as base_mod
+        import skbio.io.format._base as fmt_base
+        orig_scratch = base_mod._seg_scratch
+        orig_str = fmt_base._str_array
+
+        def spy_scratch(cap, dtype):
+            bufs = orig_scratch(cap, dtype)
+            scratch_records.append(sum(b.nbytes for b in bufs))
+            return bufs
+
+        def spy_str(segment):
+            arr = orig_str(segment)
+            str_records.append(arr.nbytes)
+            return arr
+
+        fh = io.StringIO()
+        try:
+            base_mod._seg_scratch = spy_scratch
+            fmt_base._str_array = spy_str
+            dm.write(fh, format="lsmat")
+        finally:
+            base_mod._seg_scratch = orig_scratch
+            fmt_base._str_array = orig_str
+
+        # one scratch bundle, allocated once for the whole write
+        self.assertEqual(len(scratch_records), 1)
+        # one transient string array per row (n < segment cap)
+        self.assertEqual(len(str_records), n)
+        peak = scratch_records[0] + max(str_records)
+        self.assertLessEqual(peak, 8 << 20)
+        # auxiliary space does not follow the O(n^2) input/output size
+        self.assertLess(peak, cond.nbytes // 10)
+
+        # and the output is correct
+        fh.seek(0)
+        obs = DistanceMatrix.read(fh, format="lsmat")
+        fh.close()
+        npt.assert_array_equal(obs.redundant_form(), dm.redundant_form())
 
 
 class SnifferTests(LSMatTestData):

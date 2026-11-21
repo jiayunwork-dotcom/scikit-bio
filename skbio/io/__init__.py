@@ -112,6 +112,7 @@ Exceptions and warnings
 
 .. autosummary::
 
+   BinaryDMFormatError
    BLAST7FormatError
    ClustalFormatError
    EMBLFormatError
@@ -313,6 +314,7 @@ from ._warning import FormatIdentificationWarning, ArgumentOverrideWarning
 from ._exception import (
     UnrecognizedFormatError,
     FileFormatError,
+    BinaryDMFormatError,
     BLAST7FormatError,
     ClustalFormatError,
     FASTAFormatError,
@@ -348,6 +350,7 @@ __all__ = [
     "UnrecognizedFormatError",
     "IOSourceError",
     "FileFormatError",
+    "BinaryDMFormatError",
     "BLAST7FormatError",
     "ClustalFormatError",
     "EMBLFormatError",

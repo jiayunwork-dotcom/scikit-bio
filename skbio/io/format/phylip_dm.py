@@ -214,6 +214,7 @@ import numpy as np
 
 from skbio.stats.distance import DistanceMatrix
 from skbio.io import create_format, PhylipDMFormatError
+from skbio.io.format._base import _DELIMITED_SEG_CAP, _format_segments
 
 phylip_dm = create_format("phylip_dm")
 
@@ -371,16 +372,23 @@ def _matrix_to_phylip_dm(obj, fh, delimiter, layout):
     ids = obj.ids
     fh.write(f"{str(n_samples)}\n")
 
+    # Stream rows in bounded column segments so that condensed (1-D) storage
+    # is serialized exactly like its redundant (2-D) equivalent, without
+    # expanding the full square matrix in memory. The source object is only
+    # read, never mutated.
+    segmenter = obj._row_segmenter(_DELIMITED_SEG_CAP)
+
     # square layout
     if _check_layout(layout):
-        for id_, vals in zip(ids, obj.data):
+        for i, id_ in enumerate(ids):
             # Here we are replacing whitespace with underscore on write, but we still
             # need to be able to index the DistanceMatrix object by id (which may
             # contain whitespace) so create a separate variable for writing the id
             id_w = _remove_whitespace(id_)
             fh.write(id_w)
-            fh.write(delimiter)
-            fh.write(delimiter.join(np.asarray(obj[id_], dtype=str)))
+            for text in _format_segments(segmenter.iter_row(i), delimiter):
+                fh.write(delimiter)
+                fh.write(text)
             fh.write("\n")
 
     # lower triangular layout (default)
@@ -391,9 +399,12 @@ def _matrix_to_phylip_dm(obj, fh, delimiter, layout):
             # contain whitespace) so create a separate variable for writing the id
             id_w = _remove_whitespace(id_)
             fh.write(id_w)
-            if i > 0:
+            # row i of the lower triangle holds columns [0, i)
+            for text in _format_segments(
+                segmenter.iter_row(i, j_stop=i), delimiter
+            ):
                 fh.write(delimiter)
-                fh.write(delimiter.join(np.asarray(obj[id_][:i], dtype=str)))
+                fh.write(text)
             fh.write("\n")
 
 

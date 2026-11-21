@@ -488,6 +488,39 @@ class PairwiseMatrix(SkbioObject, PlottableMixin):
         """
         return self._data
 
+    def _row_segmenter(self, seg_cap: int | None = None) -> "_MatrixRowSegmenter":
+        r"""Create a reusable bounded-memory accessor over matrix rows.
+
+        Parameters
+        ----------
+        seg_cap : int, optional
+            Maximum number of values per returned segment. Defaults to
+            ``_ROW_SEG_CAP``. Values are clamped to ``[1, n]``.
+
+        Returns
+        -------
+        _MatrixRowSegmenter
+            An accessor that yields row segments of the logical square matrix
+            without expanding condensed storage. Scratch space is bounded by
+            ``seg_cap`` regardless of the matrix size.
+
+        See Also
+        --------
+        redundant_form
+        condensed_form
+
+        Notes
+        -----
+        This is a private hook shared by the text (``lsmat``, ``phylip_dm``)
+        and binary (``binary_dm``) writers so that all of them observe the
+        same logical matrix (IDs, values, and diagonal) without allocating
+        the full redundant form.
+
+        """
+        if seg_cap is None:
+            seg_cap = _ROW_SEG_CAP
+        return _MatrixRowSegmenter(self, seg_cap)
+
     def copy(self) -> PairwiseMatrix:
         r"""Return a deep copy of the matrix.
 
@@ -2825,6 +2858,211 @@ def _get_row_from_condensed(
         row[j_after] = condensed_data[_condensed_index(row_idx, j_after, n)]
 
     return row
+
+
+# Default maximum number of values in one row segment produced by
+# ``_MatrixRowSegmenter``. Scratch space per segmenter is
+# ``seg_cap * (itemsize + 24)`` bytes (one data buffer plus three int64
+# index buffers), i.e. at most 2 MiB for float64 at this default.
+_ROW_SEG_CAP = 1 << 16
+
+
+def _seg_scratch(cap: int, dtype) -> tuple:
+    """Allocate the reusable scratch buffers of a ``_MatrixRowSegmenter``.
+
+    Parameters
+    ----------
+    cap : int
+        Maximum number of values per segment.
+    dtype : np.dtype
+        Data type of the matrix values.
+
+    Returns
+    -------
+    tuple of ndarray
+        ``(out, js, idx, tmp)``: one data buffer of ``dtype`` and three
+        int64 index buffers, each holding ``cap`` elements.
+
+    Notes
+    -----
+    All auxiliary numeric allocations of the condensed row-segment path go
+    through this function, so tests (and users) can wrap it to obtain an
+    exact allocation record of the streaming writers.
+
+    """
+    return (
+        np.empty(cap, dtype=dtype),
+        np.arange(cap, dtype=np.int64),
+        np.empty(cap, dtype=np.int64),
+        np.empty(cap, dtype=np.int64),
+    )
+
+
+class _MatrixRowSegmenter:
+    r"""Stream rows of a pairwise matrix in bounded-memory column segments.
+
+    Parameters
+    ----------
+    matrix : PairwiseMatrix
+        The matrix to read from. Its data, IDs, and diagonal are only read,
+        never mutated.
+    seg_cap : int
+        Maximum number of values per segment. Clamped to ``[1, n]``.
+
+    Notes
+    -----
+    For a matrix in redundant (2-D) form, segments are views into the
+    underlying data and no scratch space is needed. For condensed (1-D)
+    form, segments are composed in a handful of reusable buffers allocated
+    once via :func:`_seg_scratch`, so auxiliary memory stays O(seg_cap)
+    instead of O(n^2).
+
+    Returned segments must be treated as read-only and remain valid only
+    until the next segment is requested (they may be views or reused
+    buffers).
+
+    """
+
+    def __init__(self, matrix: PairwiseMatrix, seg_cap: int):
+        n = matrix.shape[0]
+        self._n = n
+        self._cap = max(1, min(int(seg_cap), n))
+        self._condensed = bool(matrix._flags["CONDENSED"])
+        self._data = matrix._data
+        if not self._condensed:
+            self._dtype = getattr(self._data, "dtype", None)
+            return
+        self._diag = getattr(matrix, "_diagonal", None)
+        data = self._data
+        if _aac.is_numpy_array(data):
+            self._xp = None
+            self._dtype = data.dtype
+        else:
+            # Non-NumPy (array-API) condensed buffer: gather segment-sized
+            # pieces on its device and transfer only those to the host.
+            self._xp = _aac.array_namespace(data)
+            self._dev = getattr(data, "device", None)
+            self._dtype = _to_numpy(data[:1]).dtype
+        (
+            self._out,
+            self._js,
+            self._idx,
+            self._tmp,
+        ) = _seg_scratch(self._cap, self._dtype)
+
+    @property
+    def n(self) -> int:
+        """Number of rows/columns of the logical square matrix."""
+        return self._n
+
+    @property
+    def dtype(self):
+        """Host (NumPy) data type of the yielded segments."""
+        return self._dtype
+
+    def iter_row(self, i: int, j_start: int = 0, j_stop: int | None = None):
+        r"""Yield row ``i`` in column segments.
+
+        Parameters
+        ----------
+        i : int
+            Row index.
+        j_start : int, optional
+            First column to include. Default is 0.
+        j_stop : int, optional
+            One past the last column to include. Default is ``n``.
+
+        Yields
+        ------
+        j0 : int
+            First column of the segment (inclusive).
+        j1 : int
+            Last column of the segment (exclusive).
+        segment : ndarray
+            Values ``M[i, j0:j1]`` of the logical square matrix. Read-only;
+            invalidated by the next segment request.
+
+        """
+        n = self._n
+        stop = n if j_stop is None else min(j_stop, n)
+        j0 = max(0, j_start)
+        cap = self._cap
+        while j0 < stop:
+            j1 = min(j0 + cap, stop)
+            yield j0, j1, self._segment(i, j0, j1)
+            j0 = j1
+
+    def _segment(self, i: int, j0: int, j1: int) -> NDArray:
+        """Return values ``M[i, j0:j1]`` of the logical square matrix."""
+        if not self._condensed:
+            return self._data[i, j0:j1]
+
+        n = self._n
+        m = j1 - j0
+        out = self._out[:m]
+
+        # Head: columns [j0, min(j1, i)) mirror the lower triangle and are
+        # gathered from scattered positions of the condensed vector.
+        h = min(j1, i)
+        mh = h - j0
+        if mh > 0:
+            self._fill_head(i, j0, mh, out)
+
+        # Diagonal element, if covered by this segment.
+        if j0 <= i < j1:
+            out[i - j0] = self._diag_value(i)
+
+        # Tail: columns [max(j0, i + 1), j1) occupy contiguous positions in
+        # the condensed vector.
+        t = max(j0, i + 1)
+        if t < j1:
+            p0 = i * n + t - (i + 2) * (i + 1) // 2
+            self._fill_tail(p0, j1 - t, out[t - j0 :])
+
+        return out
+
+    def _fill_head(self, i: int, j0: int, m: int, out: NDArray) -> None:
+        """Gather ``M[i, j0:j0+m]`` (all below the diagonal) into ``out``."""
+        # For head column j of row i, the condensed position is
+        #     p(j) = j*n + i - (j+1)*(j+2)/2          (see _condensed_index)
+        # With j = j0 + k this decomposes into
+        #     p(j0 + k) = p(j0) + k*n - k*(2*j0 + 3 + k)/2
+        # which is evaluated with in-place operations on the reusable
+        # buffers only: no per-segment temporary is allocated.
+        js = self._js[:m]
+        idx = self._idx[:m]
+        tmp = self._tmp[:m]
+        p0 = j0 * self._n + i - (j0 + 1) * (j0 + 2) // 2
+        np.multiply(js, self._n, out=idx)
+        idx += p0
+        np.add(js, 2 * j0 + 3, out=tmp)
+        tmp *= js
+        # k*(2*j0 + 3 + k) is always even, so the halving is exact.
+        tmp //= 2
+        idx -= tmp
+        if self._xp is None:
+            np.take(self._data, idx, out=out[:m])
+        else:
+            idx_dev = self._xp.asarray(idx, device=self._dev)
+            out[:m] = _to_numpy(self._data[idx_dev])
+
+    def _fill_tail(self, p0: int, k: int, target: NDArray) -> None:
+        """Copy ``k`` contiguous condensed values from ``p0`` into ``target``."""
+        if self._xp is None:
+            target[:] = self._data[p0 : p0 + k]
+        else:
+            target[:] = _to_numpy(self._data[p0 : p0 + k])
+
+    def _diag_value(self, i: int):
+        """Return the diagonal value at position ``i``."""
+        diag = self._diag
+        if diag is None:
+            return 0.0
+        if isinstance(diag, (float, int, np.floating, np.integer)):
+            return diag
+        if isinstance(diag, np.ndarray):
+            return diag[i]
+        return _to_numpy(diag[i : i + 1])[0]
 
 
 # Alias `DissimilarityMatrix` for backward compatibility

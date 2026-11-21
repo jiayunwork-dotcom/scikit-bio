@@ -237,3 +237,56 @@ def _too_many_blanks(fh, max_blanks):
                 break
     fh.seek(0)
     return too_many
+
+
+# Maximum number of matrix values formatted as text in one go by the
+# delimited pairwise-matrix writers (``lsmat``, ``phylip_dm``). Bounds the
+# string-conversion workspace of a row segment to roughly 0.5 MiB
+# (4096 values x 128 bytes per "<U32" element) regardless of matrix size.
+_DELIMITED_SEG_CAP = 1 << 12
+
+
+def _str_array(segment):
+    """Convert a numeric row segment into its string representation.
+
+    Parameters
+    ----------
+    segment : ndarray
+        One-dimensional array of matrix values.
+
+    Returns
+    -------
+    ndarray of str
+        Element-wise string representation, matching ``np.asarray(segment,
+        dtype=str)`` (shortest round-trip formatting per element).
+
+    Notes
+    -----
+    Kept as a separate function so that the allocation of the (transient)
+    string array can be intercepted and recorded in tests.
+
+    """
+    return np.asarray(segment, dtype=str)
+
+
+def _format_segments(segments, delimiter):
+    r"""Format matrix row segments as delimiter-joined text.
+
+    Parameters
+    ----------
+    segments : iterable of (int, int, ndarray)
+        Row segments as yielded by the ``iter_row`` method of the segmenter
+        returned by ``PairwiseMatrix._row_segmenter``.
+    delimiter : str
+        Column delimiter.
+
+    Yields
+    ------
+    str
+        Delimiter-joined values of each segment, in order. Concatenating
+        the yielded strings with ``delimiter`` in between reproduces the
+        full delimited row.
+
+    """
+    for _, _, segment in segments:
+        yield delimiter.join(_str_array(segment))

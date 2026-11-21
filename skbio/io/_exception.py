@@ -73,6 +73,12 @@ class LSMatFormatError(FileFormatError):
     pass
 
 
+class BinaryDMFormatError(FileFormatError):
+    """Raised when a ``binary_dm`` formatted file cannot be parsed."""
+
+    pass
+
+
 class OrdinationFormatError(FileFormatError):
     """Raised when an ``ordination`` formatted file cannot be parsed."""
 

@@ -8,8 +8,10 @@
 
 import unittest
 import io
+from unittest.mock import patch
 
 import numpy as np
+import numpy.testing as npt
 
 from skbio.util import get_data_path
 from skbio.io.format.phylip_dm import (
@@ -338,6 +340,99 @@ class TestWriters(unittest.TestCase):
             self.dm_square.write(fh, format="phylip_dm", layout="xyz")
         self.assertEqual(str(e.exception), msg)
         fh.close()
+
+
+class TestWritersCondensed(unittest.TestCase):
+    """Condensed (1-D) storage must write the same PHYLIP text as 2-D."""
+
+    def setUp(self):
+        self.ids = ["a", "b", "c", "d"]
+        self.condensed = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        self.square = [[0.0, 1.0, 2.0, 3.0],
+                       [1.0, 0.0, 4.0, 5.0],
+                       [2.0, 4.0, 0.0, 6.0],
+                       [3.0, 5.0, 6.0, 0.0]]
+        self.exp_lower = (
+            "4\na\nb\t1.0\nc\t2.0\t4.0\nd\t3.0\t5.0\t6.0\n"
+        )
+        self.exp_square = (
+            "4\na\t0.0\t1.0\t2.0\t3.0\nb\t1.0\t0.0\t4.0\t5.0\n"
+            "c\t2.0\t4.0\t0.0\t6.0\nd\t3.0\t5.0\t6.0\t0.0\n"
+        )
+
+    def write_str(self, obj, layout):
+        fh = io.StringIO()
+        obj.write(fh, format="phylip_dm", layout=layout)
+        value = fh.getvalue()
+        fh.close()
+        return value
+
+    def test_two_sample_condensed_square(self):
+        # Regression: condensed n=2 previously wrote only the first row in
+        # square layout (the condensed vector is shorter than the ID list).
+        dm = DistanceMatrix([7.0], ids=["x", "y"], condensed=True)
+        self.assertEqual(
+            self.write_str(dm, "square"),
+            "2\nx\t0.0\t7.0\ny\t7.0\t0.0\n",
+        )
+
+    def test_two_sample_condensed_lower(self):
+        dm = DistanceMatrix([7.0], ids=["x", "y"], condensed=True)
+        self.assertEqual(self.write_str(dm, "lower"), "2\nx\ny\t7.0\n")
+
+    def test_condensed_both_layouts(self):
+        dm = DistanceMatrix(self.condensed, ids=self.ids, condensed=True)
+        self.assertEqual(self.write_str(dm, "lower"), self.exp_lower)
+        self.assertEqual(self.write_str(dm, "square"), self.exp_square)
+
+    def test_condensed_float32(self):
+        dm = DistanceMatrix(np.asarray(self.condensed, dtype="float32"),
+                            ids=self.ids, condensed=True)
+        self.assertEqual(self.write_str(dm, "lower"), self.exp_lower)
+        self.assertEqual(self.write_str(dm, "square"), self.exp_square)
+
+    def test_condensed_matches_redundant(self):
+        dm_cond = DistanceMatrix(self.condensed, ids=self.ids, condensed=True)
+        dm_red = DistanceMatrix(self.square, ids=self.ids)
+        for layout in ("lower", "square"):
+            self.assertEqual(
+                self.write_str(dm_cond, layout), self.write_str(dm_red, layout)
+            )
+
+    def test_small_segment_cap_same_output(self):
+        dm = DistanceMatrix(self.condensed, ids=self.ids, condensed=True)
+        with patch("skbio.io.format.phylip_dm._DELIMITED_SEG_CAP", 1):
+            self.assertEqual(self.write_str(dm, "lower"), self.exp_lower)
+            self.assertEqual(self.write_str(dm, "square"), self.exp_square)
+
+    def test_roundtrip_condensed(self):
+        dm = DistanceMatrix(self.condensed, ids=self.ids, condensed=True)
+        for layout in ("lower", "square"):
+            text = self.write_str(dm, layout)
+            obs = DistanceMatrix.read(
+                io.StringIO(text), format="phylip_dm", layout=layout
+            )
+            self.assertEqual(obs.ids, dm.ids)
+            npt.assert_array_equal(obs.redundant_form(), dm.redundant_form())
+
+    def test_source_not_mutated(self):
+        dm = DistanceMatrix(self.condensed, ids=self.ids, condensed=True)
+        data_before = dm.data
+        snapshot = dm.data.copy()
+        self.write_str(dm, "square")
+        self.write_str(dm, "lower")
+        self.assertIs(dm.data, data_before)
+        self.assertTrue(dm._flags["CONDENSED"])
+        self.assertEqual(dm.ids, tuple(self.ids))
+        npt.assert_array_equal(dm.data, snapshot)
+
+    def test_whitespace_ids_replaced(self):
+        dm = DistanceMatrix(self.condensed,
+                            ids=["s 1", "s 2", "s 3", "s 4"],
+                            condensed=True)
+        text = self.write_str(dm, "square")
+        self.assertTrue(text.startswith("4\ns_1\t"))
+        self.assertIn("\ns_4\t", text)
 
 
 if __name__ == "__main__":

@@ -35,6 +35,7 @@ from skbio.stats.distance import (
     randdm,
 )
 from skbio.stats.distance._base import _preprocess_input, _run_monte_carlo_stats
+from skbio.stats.distance._base import _MatrixRowSegmenter, _ROW_SEG_CAP
 from skbio.stats.distance._utils import is_symmetric_and_hollow
 from skbio.util import assert_data_frame_almost_equal
 from skbio.util._testing import assert_series_almost_equal
@@ -2636,6 +2637,167 @@ class SymmetricMatrixArrayAPITests(TestCase, ArrayAPITestMixin):
         red = sm.redundant_form()
         self.assert_type_preserved(red, xp, device)
         self.assert_close(red, self.data)
+
+
+class MatrixRowSegmenterTests(TestCase):
+    """Tests for the bounded-memory row segment accessor."""
+
+    def make_logical(self, n, dtype="float64"):
+        """A symmetric, hollow logical matrix with distinct values."""
+        rng = np.random.default_rng(42)
+        cond = rng.random(n * (n - 1) // 2).astype(dtype)
+        cond += 0.5  # keep values clearly non-zero
+        return cond
+
+    def collect_row(self, segmenter, i, j_start=0, j_stop=None):
+        parts = []
+        spans = []
+        for j0, j1, seg in segmenter.iter_row(i, j_start=j_start, j_stop=j_stop):
+            spans.append((j0, j1))
+            self.assertEqual(seg.shape, (j1 - j0,))
+            parts.append(np.array(seg))  # copy: buffer may be reused
+        return spans, parts
+
+    def test_condensed_matches_redundant(self):
+        for dtype in ("float64", "float32"):
+            for n in (1, 2, 3, 5, 8):
+                cond = self.make_logical(n, dtype)
+                dm = DistanceMatrix(cond, ids=[str(i) for i in range(n)],
+                                    condensed=True)
+                exp = dm.redundant_form()
+                for cap in (1, 2, 3, 1000):
+                    segmenter = dm._row_segmenter(cap)
+                    self.assertEqual(segmenter.n, n)
+                    for i in range(n):
+                        spans, parts = self.collect_row(segmenter, i)
+                        # segments tile the whole row in order
+                        self.assertEqual(spans[0][0], 0)
+                        self.assertEqual(spans[-1][1], n)
+                        for (a, b), (c, d) in zip(spans, spans[1:]):
+                            self.assertEqual(b, c)
+                            self.assertLessEqual(d - c, max(1, min(cap, n)))
+                        obs = np.concatenate(parts)
+                        self.assertEqual(obs.dtype, np.dtype(dtype))
+                        npt.assert_array_equal(obs, exp[i])
+
+    def test_condensed_scalar_diagonal(self):
+        sm = SymmetricMatrix([1, 2, 3, 4, 5, 6], ids=list("abcd"),
+                             condensed=True, diagonal=7.5)
+        segmenter = sm._row_segmenter(2)
+        exp = sm.redundant_form()
+        for i in range(4):
+            _, parts = self.collect_row(segmenter, i)
+            row = np.concatenate(parts)
+            npt.assert_array_equal(row, exp[i])
+            self.assertEqual(row[i], 7.5)
+
+    def test_condensed_array_diagonal(self):
+        diag = np.array([11.0, 12.0, 13.0, 14.0])
+        sm = SymmetricMatrix([1, 2, 3, 4, 5, 6], ids=list("abcd"),
+                             condensed=True, diagonal=diag)
+        segmenter = sm._row_segmenter(3)
+        exp = sm.redundant_form()
+        for i in range(4):
+            _, parts = self.collect_row(segmenter, i)
+            npt.assert_array_equal(np.concatenate(parts), exp[i])
+
+    def test_redundant_returns_views(self):
+        data = np.array([[0.0, 1.0, 2.0], [1.0, 0.0, 3.0], [2.0, 3.0, 0.0]])
+        dm = DistanceMatrix(data, ids=["a", "b", "c"])
+        segmenter = dm._row_segmenter(2)
+        spans, parts = self.collect_row(segmenter, 1)
+        self.assertEqual(spans, [(0, 2), (2, 3)])
+        npt.assert_array_equal(np.concatenate(parts), data[1])
+        # segments are views into the original buffer, not copies
+        seg = next(dm._row_segmenter(10).iter_row(0))[2]
+        self.assertTrue(np.shares_memory(seg, dm.data))
+
+    def test_pairwise_asymmetric(self):
+        data = np.array([[0.0, 1.0, 2.0], [-1.0, 0.0, 3.0], [-2.0, -3.0, 0.0]])
+        pm = PairwiseMatrix(data, ids=["a", "b", "c"])
+        segmenter = pm._row_segmenter(2)
+        for i in range(3):
+            _, parts = self.collect_row(segmenter, i)
+            npt.assert_array_equal(np.concatenate(parts), data[i])
+
+    def test_row_window(self):
+        cond = self.make_logical(6)
+        dm = DistanceMatrix(cond, condensed=True)
+        exp = dm.redundant_form()
+        segmenter = dm._row_segmenter(2)
+        spans, parts = self.collect_row(segmenter, 4, j_start=1, j_stop=5)
+        self.assertEqual(spans, [(1, 3), (3, 5)])
+        npt.assert_array_equal(np.concatenate(parts), exp[4, 1:5])
+        # j_stop clamped to n; empty window yields nothing
+        spans, parts = self.collect_row(segmenter, 2, j_start=4, j_stop=99)
+        self.assertEqual(spans[-1][1], 6)
+        self.assertEqual(list(segmenter.iter_row(0, j_start=3, j_stop=3)), [])
+
+    def test_does_not_mutate_source(self):
+        cond = self.make_logical(7)
+        dm = DistanceMatrix(cond.copy(), ids=list("abcdefg"), condensed=True)
+        data_before = dm.data
+        snapshot = dm.data.copy()
+        segmenter = dm._row_segmenter(3)
+        for i in range(7):
+            self.collect_row(segmenter, i)
+        self.assertIs(dm.data, data_before)
+        self.assertTrue(dm._flags["CONDENSED"])
+        self.assertEqual(dm.ids, tuple("abcdefg"))
+        npt.assert_array_equal(dm.data, snapshot)
+
+    def test_default_cap(self):
+        dm = DistanceMatrix(self.make_logical(3), condensed=True)
+        segmenter = dm._row_segmenter()
+        self.assertEqual(segmenter._cap, min(_ROW_SEG_CAP, 3))
+
+    def test_scratch_allocation_record(self):
+        # condensed: exactly one scratch bundle of bounded size
+        rec = []
+
+        import skbio.stats.distance._base as base_mod
+        orig = base_mod._seg_scratch
+
+        def spy(cap, dtype):
+            bufs = orig(cap, dtype)
+            rec.append((cap, np.dtype(dtype).itemsize,
+                        sum(b.nbytes for b in bufs)))
+            return bufs
+
+        base_mod._seg_scratch = spy
+        try:
+            n = 300
+            cond = self.make_logical(n)
+            dm = DistanceMatrix(cond, condensed=True)
+            segmenter = dm._row_segmenter(128)
+            for i in range(n):
+                self.collect_row(segmenter, i)
+        finally:
+            base_mod._seg_scratch = orig
+        self.assertEqual(len(rec), 1)
+        cap, itemsize, total = rec[0]
+        self.assertEqual(cap, 128)
+        self.assertEqual(total, 128 * (itemsize + 3 * 8))
+        self.assertLessEqual(total, 8 << 20)
+
+    def test_no_scratch_for_redundant(self):
+        rec = []
+
+        import skbio.stats.distance._base as base_mod
+        orig = base_mod._seg_scratch
+
+        def spy(cap, dtype):
+            rec.append(cap)
+            return orig(cap, dtype)
+
+        base_mod._seg_scratch = spy
+        try:
+            dm = DistanceMatrix([[0.0, 1.0], [1.0, 0.0]])
+            segmenter = dm._row_segmenter(1)
+            self.collect_row(segmenter, 0)
+        finally:
+            base_mod._seg_scratch = orig
+        self.assertEqual(rec, [])
 
 
 if __name__ == "__main__":

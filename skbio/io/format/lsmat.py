@@ -87,6 +87,7 @@ import numpy as np
 
 from skbio.stats.distance import PairwiseMatrix, DistanceMatrix, SymmetricMatrix
 from skbio.io import create_format, LSMatFormatError
+from skbio.io.format._base import _DELIMITED_SEG_CAP, _format_segments
 
 
 lsmat = create_format("lsmat")
@@ -269,10 +270,16 @@ def _matrix_to_lsmat(obj, fh, delimiter):
     fh.write(_format_ids(ids, delimiter))
     fh.write("\n")
 
-    for id_, vals in zip(ids, obj.data):
+    # Stream rows in bounded column segments so that condensed (1-D) storage
+    # is serialized exactly like its redundant (2-D) equivalent, without
+    # expanding the full square matrix in memory. The source object is only
+    # read, never mutated.
+    segmenter = obj._row_segmenter(_DELIMITED_SEG_CAP)
+    for i, id_ in enumerate(ids):
         fh.write("%s" % id_)
-        fh.write(delimiter)
-        fh.write(delimiter.join(np.asarray(vals, dtype=str)))
+        for text in _format_segments(segmenter.iter_row(i), delimiter):
+            fh.write(delimiter)
+            fh.write(text)
         fh.write("\n")
 
 
